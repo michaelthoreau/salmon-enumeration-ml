@@ -2,4 +2,6 @@
 runs
 __pycache__
 data
-data_big
+data_bigapp/node_modules/
+app/frontend/node_modules
+app/node_modules/
