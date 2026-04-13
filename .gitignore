@@ -1,0 +1,5 @@
+.vscode
+runs
+__pycache__
+data
+data_big
