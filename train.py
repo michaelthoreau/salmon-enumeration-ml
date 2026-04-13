@@ -104,7 +104,7 @@ def main(
     WOT  = 0.0              # optimal-transport loss (off)
     WTV  = 0.0              # total-variation loss (off)
 
-    CROP_SIZE   = 256
+    CROP_SIZE   = 640
     NUM_QUERIES = MODEL_CFG.num_queries
     THRESHOLD   = 0.35
 
