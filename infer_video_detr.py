@@ -42,6 +42,7 @@ from PIL import Image
 from torchvision import transforms as T
 from torchvision.ops import nms as tv_nms
 from tqdm import tqdm
+from tracker import BYTETracker, get_motion_vector, reject_outliers_iqr
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -90,7 +91,64 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
     model = DetrForObjectDetection(config)
     if companion_mode:
         _expand_first_conv_6ch(model)
-    model.load_state_dict(ckpt['state_dict'], strict=False)
+        
+    # Map state dict keys dynamically to handle transformers version mismatches (e.g. model.backbone.model vs model.backbone.conv_encoder.model, self_attn.o_proj vs self_attn.out_proj, etc.)
+    model_keys = set(model.state_dict().keys())
+    state_dict = ckpt['state_dict']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k not in model_keys:
+            # 1. Backbone mapping
+            if "model.backbone.model." in k:
+                k_alt = k.replace("model.backbone.model.", "model.backbone.conv_encoder.model.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            elif "model.backbone.conv_encoder.model." in k:
+                k_alt = k.replace("model.backbone.conv_encoder.model.", "model.backbone.model.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            
+            # 2. Attention projection mapping
+            if "self_attn.o_proj." in k:
+                k_alt = k.replace("self_attn.o_proj.", "self_attn.out_proj.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            elif "self_attn.out_proj." in k:
+                k_alt = k.replace("self_attn.out_proj.", "self_attn.o_proj.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+                    
+            if "encoder_attn.o_proj." in k:
+                k_alt = k.replace("encoder_attn.o_proj.", "encoder_attn.out_proj.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            elif "encoder_attn.out_proj." in k:
+                k_alt = k.replace("encoder_attn.out_proj.", "encoder_attn.o_proj.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            
+            # 3. MLP fc mapping
+            if ".mlp.fc1." in k:
+                k_alt = k.replace(".mlp.fc1.", ".fc1.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            elif ".fc1." in k:
+                k_alt = k.replace(".fc1.", ".mlp.fc1.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            
+            if ".mlp.fc2." in k:
+                k_alt = k.replace(".mlp.fc2.", ".fc2.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+            elif ".fc2." in k:
+                k_alt = k.replace(".fc2.", ".mlp.fc2.", 1)
+                if k_alt in model_keys:
+                    k = k_alt
+                    
+        new_state_dict[k] = v
+        
+    model.load_state_dict(new_state_dict, strict=False)
     model.eval().cuda()
     return model
 
@@ -146,7 +204,8 @@ def infer_frame(
     companion_bgr: np.ndarray | None = None,
 ) -> list[tuple[int, int]]:
     """Single-frame inference (convenience wrapper around the batch version)."""
-    return _infer_batch(model, [(frame_bgr, companion_bgr)], img_size, score_thresh, iou_thresh)[0]
+    batch_res = _infer_batch(model, [(frame_bgr, companion_bgr)], img_size, score_thresh, iou_thresh)[0]
+    return [(r[0], r[1]) for r in batch_res]
 
 
 @torch.no_grad()
@@ -157,7 +216,7 @@ def _infer_batch(
     score_thresh: float,
     iou_thresh: float,
     tile_batch_size: int = 2,
-) -> list[list[tuple[int, int]]]:
+) -> list[list[tuple[int, int, float, float, float, float, float]]]:
     """
     Infer on multiple frames.  Tiles are collected across all frames and sent
     to the GPU in sub-batches of `tile_batch_size`, balancing throughput vs VRAM.
@@ -205,8 +264,14 @@ def _infer_batch(
             bc   = torch.cat(frame_boxes[fi], 0)
             sc   = torch.cat(frame_scores[fi], 0)
             kept = tv_nms(bc, sc, iou_threshold=iou_thresh)
-            results.append([(int((bc[i][0]+bc[i][2])/2), int((bc[i][1]+bc[i][3])/2))
-                             for i in kept.tolist()])
+            frame_res = []
+            for i in kept.tolist():
+                x1, y1, x2, y2 = bc[i].tolist()
+                score = sc[i].item()
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                frame_res.append((cx, cy, x1, y1, x2, y2, score))
+            results.append(frame_res)
         else:
             results.append([])
     return results
@@ -218,9 +283,75 @@ def _infer_batch(
 
 def _draw_centroids(frame: np.ndarray, centroids: list, radius: int = 6) -> np.ndarray:
     frame = frame.copy()
-    for x, y in centroids:
-        cv2.circle(frame, (x, y), radius + 2, (0, 0, 0), -1)          # black border
-        cv2.circle(frame, (x, y), radius,     (0, 220, 80), -1)        # green fill
+    for item in centroids:
+        # item is (cx, cy, track_id, prev_pos)
+        x, y, track_id, prev_pos = item
+        
+        if prev_pos is not None:
+            px, py = prev_pos
+            # Draw arrowed line representing the motion vector
+            cv2.arrowedLine(frame, (px, py), (x, y), (255, 220, 0), 2, cv2.LINE_AA, 0, 0.15)
+            # Also draw a small green circle at the head
+            cv2.circle(frame, (x, y), 4, (0, 220, 80), -1)
+        else:
+            # Too new, draw a simple dot
+            cv2.circle(frame, (x, y), radius + 2, (0, 0, 0), -1)
+            cv2.circle(frame, (x, y), radius,     (0, 220, 80), -1)
+            
+        if track_id is not None:
+            cv2.putText(frame, f"#{track_id}", (x + radius + 4, y - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"#{track_id}", (x + radius + 4, y - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return frame
+
+
+def _draw_motion_panel(frame: np.ndarray, mean_speed: float, num_tracks: int, mean_vector: np.ndarray | None, margin: int = 20) -> np.ndarray:
+    """Overlay a premium-looking motion stats panel in the top-left corner."""
+    H, W = frame.shape[:2]
+    px, py = margin, margin
+    pw, ph = 420, 115
+    
+    # Semi-transparent dark background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (20, 20, 20), -1)
+    
+    # Border
+    accent_color = (0, 215, 90)  # Bright green
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), accent_color, 2)
+    
+    frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+    
+    # Title
+    cv2.putText(frame, "MOTION ANALYSIS (1s window)", (px + 16, py + 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+    
+    # Speed value
+    speed_text = f"{mean_speed:.1f} px/s" if mean_speed > 0 else "Calculating..."
+    cv2.putText(frame, speed_text, (px + 16, py + 68),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                
+    # Active tracks count
+    tracks_text = f"Tracked Fish: {num_tracks}"
+    cv2.putText(frame, tracks_text, (px + 16, py + 98),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 220, 180), 1, cv2.LINE_AA)
+                
+    # Compass / Arrow for predominant direction
+    if mean_vector is not None and np.linalg.norm(mean_vector) > 1e-3:
+        cx_c, cy_c = px + 355, py + 60
+        r_c = 28
+        cv2.circle(frame, (cx_c, cy_c), r_c, (60, 60, 60), 1, cv2.LINE_AA)
+        
+        vx, vy = mean_vector
+        norm_v = np.sqrt(vx*vx + vy*vy)
+        ux, uy = vx / norm_v, vy / norm_v
+        
+        arrow_end_x = int(cx_c + r_c * ux)
+        arrow_end_y = int(cy_c + r_c * uy)
+        
+        cv2.arrowedLine(frame, (cx_c, cy_c), (arrow_end_x, arrow_end_y), (255, 220, 0), 3, cv2.LINE_AA, 0, 0.35)
+        cv2.circle(frame, (cx_c, cy_c), 3, (255, 255, 255), -1)
+        
     return frame
 
 
@@ -315,13 +446,13 @@ def main(
     video: str,
     output: str         = None,
     img_size: int       = 512,
-    score_thresh: float = 0.25,
+    score_thresh: float = 0.35,
     iou_thresh: float   = 0.5,
     num_queries: int    = 100,
     companion_mode: str = None,   # 'prev10' | 'background' | None
     ma_window: int      = 30,     # moving-average window (frames)
-    graph_height: int   = 220,
-    graph_width: int    = 560,
+    graph_height: int   = 280,
+    graph_width: int    = 700,
     dot_radius: int     = 6,
     max_frames: int     = 0,
     infer_every: int    = 1,
@@ -387,9 +518,6 @@ def main(
     # ---- count history for graph ----
     count_history: deque[int] = deque(maxlen=max(ma_window * 3, 90))
 
-    # ---- process ----
-    pbar = tqdm(total=n_to_process, desc='Inferring', unit='frame', ncols=100)
-
     # ---- process in batched blocks ----
     # Each block = batch_frames × infer_every frames.
     # Inference frames within a block are batched into one GPU forward pass,
@@ -399,22 +527,65 @@ def main(
     infer_in_block: list[tuple[np.ndarray, np.ndarray | None, int]] = []
     last_centroids: list = []
     last_count: int      = 0
+    last_mean_speed: float = 0.0
+    last_mean_vector: np.ndarray | None = None
+
+    # ---- initialize tracker ----
+    tracker = BYTETracker(track_thresh=score_thresh, track_buffer=ma_window)
 
     pbar = tqdm(total=n_to_process, desc='Inferring', unit='frame', ncols=100)
 
     def _write_block():
-        nonlocal last_centroids, last_count
+        nonlocal last_centroids, last_count, last_mean_speed, last_mean_vector
         batch_results = (_infer_batch(model, [(f, c) for f, c, _ in infer_in_block],
                                       img_size, score_thresh, iou_thresh,
                                       tile_batch_size=tile_batch_size)
-                         if infer_in_block else [])
+                          if infer_in_block else [])
         infer_by_pos = {pos: res for (_, _, pos), res in zip(infer_in_block, batch_results)}
 
         for pos, (frame_bgr, _) in enumerate(frame_block):
+            abs_frame_idx = frame_idx - len(frame_block) + pos
             if pos in infer_by_pos:
-                last_centroids = infer_by_pos[pos]
-                last_count     = len(last_centroids)
+                detections = infer_by_pos[pos]  # list of (cx, cy, x1, y1, x2, y2, score)
+                tracker_inputs = [[d[2], d[3], d[4], d[5], d[6]] for d in detections]
+                
+                # Update tracker
+                tracker.frame_id = abs_frame_idx
+                active_tracks = tracker.update(tracker_inputs)
+                
+                # Extract centroids
+                last_centroids = []
+                motion_vectors = []
+                for track in active_tracks:
+                    cx = int((track.tlbr[0] + track.tlbr[2]) / 2)
+                    cy = int((track.tlbr[1] + track.tlbr[3]) / 2)
+                    
+                    # Compute motion vector and retrieve historical position
+                    mv_res = get_motion_vector(track, abs_frame_idx, fps)
+                    if mv_res is not None:
+                        mv, cx_prev, cy_prev = mv_res
+                        motion_vectors.append(mv)
+                        last_centroids.append((cx, cy, track.track_id, (int(cx_prev), int(cy_prev))))
+                    else:
+                        last_centroids.append((cx, cy, track.track_id, None))
+                        
+                # Outlier rejection & average speed/direction
+                if len(motion_vectors) > 0:
+                    filtered_vectors = reject_outliers_iqr(motion_vectors)
+                    if len(filtered_vectors) > 0:
+                        speeds = np.linalg.norm(filtered_vectors, axis=1)
+                        last_mean_speed = float(np.mean(speeds))
+                        last_mean_vector = np.mean(filtered_vectors, axis=0)
+                    else:
+                        last_mean_speed = 0.0
+                        last_mean_vector = None
+                else:
+                    last_mean_speed = 0.0
+                    last_mean_vector = None
+
+                last_count = len(last_centroids)
                 count_history.append(last_count)
+
             ma_val    = sum(count_history) / max(len(count_history), 1)
             out_frame = _draw_centroids(frame_bgr, last_centroids, radius=dot_radius)
             out_frame = _draw_count_graph(
@@ -423,10 +594,12 @@ def main(
                 traverse_seconds=traverse_seconds,
                 graph_h=graph_height, graph_w=graph_width,
             )
+            out_frame = _draw_motion_panel(out_frame, last_mean_speed, len(last_centroids), last_mean_vector)
             writer.write(out_frame)
             pbar.update(1)
         pbar.set_postfix(count=last_count,
-                         ma=f'{sum(count_history)/max(len(count_history),1):.1f}')
+                         ma=f'{sum(count_history)/max(len(count_history),1):.1f}',
+                         speed=f'{last_mean_speed:.1f}')
 
     frame_idx = 0
     while frame_idx < n_to_process:
