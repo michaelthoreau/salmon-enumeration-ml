@@ -47,3 +47,21 @@ class DBAnnotation(SQLModel, table=True):
     # JSON-encoded list of [x, y] pairs
     points_json: str = Field(default="[]")
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class DBVideoFrame(SQLModel, table=True):
+    """Tracks video frames that have been committed for annotation."""
+    __tablename__ = "video_frames"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    uuid: str = Field(index=True, unique=True)
+    # FK to DBFile.id (must be type="video")
+    source_file_id: int = Field(index=True)
+    frame_number: int
+    split: str
+    # paths relative to DATA_ROOT — set after commit
+    frame_rel_path:      Optional[str] = Field(default=None)   # {split}/images/{uuid}.jpg
+    motion_rel_path:     Optional[str] = Field(default=None)   # {split}/images/{uuid}_prev10.jpg
+    background_rel_path: Optional[str] = Field(default=None)   # {split}/images/{uuid}_background.jpg
+    labeled_at: Optional[datetime] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)

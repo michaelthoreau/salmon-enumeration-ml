@@ -136,3 +136,49 @@ def build_backbone(args):
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model
+
+
+def expand_first_conv(joiner, in_channels: int = 6):
+    """
+    Expand the ResNet backbone's first conv from 3 to `in_channels` input channels.
+
+    Pretrained weights for the original 3 channels are kept unchanged.
+    Each additional group of 3 channels is initialised to a 0.1-scaled copy of
+    the pretrained weights so their contribution starts near-zero and the model
+    gradually learns to use them.
+
+    joiner is the Joiner (nn.Sequential wrapping Backbone + PositionEncoding)
+    returned by build_backbone().
+    """
+    import torch.nn as nn
+
+    body     = joiner[0].body          # IntermediateLayerGetter (nn.ModuleDict)
+    old_conv = body['conv1']           # original Conv2d(3, 64, 7, ...)
+
+    if old_conv.in_channels == in_channels:
+        return   # already expanded — idempotent
+
+    new_conv = nn.Conv2d(
+        in_channels,
+        old_conv.out_channels,
+        kernel_size  = old_conv.kernel_size,
+        stride       = old_conv.stride,
+        padding      = old_conv.padding,
+        bias         = old_conv.bias is not None,
+    )
+
+    with torch.no_grad():
+        # Original 3 channels — exact copy of pretrained weights
+        new_conv.weight[:, :3] = old_conv.weight.clone()
+        # Extra channels — small-scale copy; model learns their contribution
+        for start in range(3, in_channels, 3):
+            end = min(start + 3, in_channels)
+            new_conv.weight[:, start:end] = old_conv.weight[:, : end - start].clone() * 0.1
+        if old_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+
+    body['conv1'] = new_conv
+    print(f'  Backbone first conv expanded: 3 → {in_channels} input channels.', flush=True)
+    model = Joiner(backbone, position_embedding)
+    model.num_channels = backbone.num_channels
+    return model

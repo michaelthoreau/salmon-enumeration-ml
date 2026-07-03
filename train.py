@@ -26,16 +26,19 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 def main(
     save_path: str  = None,
     epochs: int     = 1500,
-    batch_size: int = 8,
-    lr: float       = 1e-5,
+    batch_size: int = 2,
+    lr: float       = 1e-4,
     lr_step: int    = 1200,
-    warmup_steps: int = 0,
-    val_every: int  = 1,
+    warmup_steps: int = 100,
+    val_every: int  = 5,
     resume: str     = None,
     workers: int    = 4,
     data_root: str  = 'data',
     limit_batches: int = 0,
-    min_batches: int = 0,
+    min_batches: int = 50,   # oversample small datasets; 20 batches/epoch min
+    crop_size: int  = 640,   # train_distributed.py default; 640 for full-res
+    num_queries: int = 100,  # max expected fish per crop; 700 for data_big
+    companion_mode: str = None,  # None | 'prev10' | 'background' — 6-ch input
 ):
     """Train IOCFormer on the salmon dataset.
 
@@ -51,7 +54,11 @@ def main(
         workers:    DataLoader worker processes.
         data_root:  Root directory containing train/val/test split folders.
         limit_batches: If >0, stop each epoch after this many batches (debug mode).
-        min_batches: If >0, repeat-sample the train set so each epoch has at least this many batches.
+        min_batches: Repeat-sample so each epoch has at least this many batches. Default 20
+                     gives 40 crops/epoch from 10 toy images. Use 0 to disable.
+        crop_size:  Crop size fed to the model. train_distributed.py default is 256;
+                    use 640 for data_big to match original full-res training.
+        num_queries: Max detectable fish per crop. 100 for toy/256px, 700 for data_big/640px.
     """
 
     # ---------------------------------------------------------------------------
@@ -62,7 +69,7 @@ def main(
         # backbone
         backbone='resnet50',
         dilation=True,          # DC5 — gives downsample_ratio=8
-        lr_backbone=1e-5,
+        lr_backbone=1e-4,
         position_embedding='sine',
         masks=False,
         frozen_weights=None,
@@ -104,8 +111,9 @@ def main(
     WOT  = 0.0              # optimal-transport loss (off)
     WTV  = 0.0              # total-variation loss (off)
 
-    CROP_SIZE   = 640
-    NUM_QUERIES = MODEL_CFG.num_queries
+    CROP_SIZE   = crop_size
+    NUM_QUERIES = num_queries
+    MODEL_CFG.num_queries = num_queries
     THRESHOLD   = 0.35
 
     # ---------------------------------------------------------------------------
@@ -139,20 +147,34 @@ def main(
     writer = SummaryWriter(SAVE_DIR)
 
     print(f'Save dir : {SAVE_DIR}', flush=True)
-    print(f'Epochs   : {epochs}  |  Batch: {batch_size}  |  LR: {lr}', flush=True)
+    print(f'Epochs   : {epochs}  |  Batch: {batch_size}  |  LR: {lr}  '
+          f'|  Crop: {crop_size}  |  Queries: {num_queries}  |  MinBatches: {min_batches}', flush=True)
 
     # ---------------------------------------------------------------------------
     # Data
     # ---------------------------------------------------------------------------
 
     def _list_images(split_dir):
-        images_dir = os.path.join(data_root, split_dir, 'images')
-        exts = {'.jpg', '.jpeg', '.png'}
-        return sorted(
-            os.path.join(images_dir, f)
-            for f in os.listdir(images_dir)
-            if os.path.splitext(f)[1].lower() in exts
-        )
+        """Return image paths that have a matching annotation JSON.
+        Looks in annotations/ first so only annotated images are included,
+        and suffix variants like _prev10.jpg / _background.jpg are naturally excluded.
+        """
+        ann_dir = os.path.join(data_root, split_dir, 'annotations')
+        img_dir = os.path.join(data_root, split_dir, 'images')
+        img_exts = ('.jpg', '.jpeg', '.png')
+        if not os.path.isdir(ann_dir) or not os.path.isdir(img_dir):
+            return []
+        result = []
+        for fname in sorted(os.listdir(ann_dir)):
+            if not fname.endswith('.json'):
+                continue
+            stem = fname[:-5]   # strip .json
+            for ext in img_exts:
+                img_path = os.path.join(img_dir, stem + ext)
+                if os.path.isfile(img_path):
+                    result.append(img_path)
+                    break
+        return result
 
     train_files = _list_images('train')
     val_files   = _list_images('val')
@@ -164,6 +186,11 @@ def main(
     # ---------------------------------------------------------------------------
 
     model, criterion, postprocessors = build_model(MODEL_CFG)
+
+    if companion_mode:
+        from Networks.CDETR.backbone import expand_first_conv
+        expand_first_conv(model.backbone, in_channels=6)
+
     model = model.cuda()
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -238,6 +265,7 @@ def main(
         'save_path': SAVE_DIR,
         'local_rank': 0,
         'distributed': False,
+        'companion_mode': companion_mode,  # None | 'prev10' | 'background'
     }
 
     # ---------------------------------------------------------------------------
@@ -345,16 +373,35 @@ def main(
             optimizer.step()
 
             losses.append(loss.item())
-            pbar.set_postfix(loss=f'{loss.item():.4f}', avg=f'{np.mean(losses):.4f}')
-            writer.add_scalar('train/loss',       loss.item(),                         global_step)
-            writer.add_scalar('train/loss_detr',  loss_detr.item(),                    global_step)
-            writer.add_scalar('train/loss_ce',    loss_dict.get('loss_ce', 0),         global_step)
-            writer.add_scalar('train/loss_point', loss_dict.get('loss_point', 0),      global_step)
+
+            # DETR predicted count: queries whose fg score > THRESHOLD
+            with torch.no_grad():
+                pred_scores = d6['pred_logits'].sigmoid()[:, :, 1]  # [N, Q]
+                pred_count  = (pred_scores > THRESHOLD).sum(dim=1).float()  # [N]
+                gt_count_detr = torch.tensor(
+                    [t['points'].shape[0] for t in targets], dtype=torch.float32)
+                detr_count_err = (pred_count.cpu() - gt_count_detr).abs().mean().item()
+
+            pbar.set_postfix(loss=f'{loss.item():.4f}', avg=f'{np.mean(losses):.4f}',
+                             cnt_err=f'{detr_count_err:.1f}')
+            writer.add_scalar('train/loss',            loss.item(),                         global_step)
+            writer.add_scalar('train/loss_detr',       loss_detr.item(),                    global_step)
+            writer.add_scalar('train/loss_ce',         loss_dict.get('loss_ce', 0),         global_step)
+            writer.add_scalar('train/loss_point',      loss_dict.get('loss_point', 0),      global_step)
+            writer.add_scalar('train/detr_count_err',  detr_count_err,                      global_step)
+            writer.add_scalar('train/detr_pred_count', pred_count.mean().item(),             global_step)
+            writer.add_scalar('train/detr_gt_count',   gt_count_detr.mean().item(),          global_step)
             if isinstance(out_all, list):
                 writer.add_scalar('train/count_l',  count_l.item(),                  global_step)
                 writer.add_scalar('train/dm_pred',  out_dm[1].sum().item() / N,       global_step)
                 writer.add_scalar('train/dm_gt',    float(gd_count.mean()),            global_step)
             writer.add_scalar('train/lr',         optimizer.param_groups[0]['lr'],    global_step)
+            # writer.add_scalar('gpu/mem_used_mb',  torch.cuda.memory_allocated() / 1e6, global_step)
+            # writer.add_scalar('gpu/mem_reserved_mb', torch.cuda.memory_reserved() / 1e6, global_step)
+            # try:
+            #     writer.add_scalar('gpu/utilization_pct', torch.cuda.utilization(), global_step)
+            # except Exception:
+            #     pass
 
         scheduler.step()   # once per epoch
         elapsed = time.time() - t0
@@ -380,15 +427,18 @@ def main(
             train=False,
             args=DS_ARGS,
         )
+        n_val = min(100, len(ds))
+        if n_val == 0:
+            print('  Val: no labeled val images, skipping.', flush=True)
+            return best_mae, 0.0
         loader = torch.utils.data.DataLoader(
             ds, batch_size=1, num_workers=2,
-            sampler=torch.utils.data.RandomSampler(ds, num_samples=min(100, len(ds))))
+            sampler=torch.utils.data.RandomSampler(ds, num_samples=n_val))
 
         model.eval()
         mae = mse = 0.0
         total_tp = total_pred = total_gt = 0
         MATCH_RADIUS = 15  # pixels
-        vis_done = False    # log density maps for the first val sample only
         debug_saved = False  # save overlay debug images for the first val sample only
 
         for fname, img, kpoint, targets, patch_info in tqdm(loader, desc='  Val', ncols=80, leave=False):
@@ -396,62 +446,25 @@ def main(
             if img.dim() == 3:    img = img.unsqueeze(0)
             if kpoint.dim() == 5: kpoint = kpoint.squeeze(0)
 
-            outputs = model(img.cuda())
-            if isinstance(outputs, list):
-                outputs, out_dm = outputs
+            # Process patches one at a time to avoid OOM on large images.
+            # A 1920×1080 image tiles into ~6 patches; batching all at once OOMs.
+            all_logits, all_pts_out, dm_count = [], [], 0.0
+            for pi in range(img.shape[0]):
+                patch_out = model(img[pi:pi+1].cuda())
+                if isinstance(patch_out, list):
+                    d6p, dmp = patch_out
+                    dm_count += dmp[1].sum().item()
+                else:
+                    d6p = patch_out
+                all_logits.append(d6p['pred_logits'].cpu())
+                all_pts_out.append(d6p['pred_points'].cpu())
+            outputs = {'pred_logits': torch.cat(all_logits, 0),
+                       'pred_points': torch.cat(all_pts_out, 0)}
 
-            count = sum(out_dm[1][k].sum().item() for k in range(out_dm[1].shape[0]))
+            count = dm_count
             gt    = kpoint.sum().item()
             mae  += abs(count - gt)
             mse  += (count - gt) ** 2
-
-            # ----- density map visualisation (first sample only) -----
-            if not vis_done and isinstance(outputs, dict):
-                vis_done = True
-                num_h = int(patch_info[0].item())
-                num_w = int(patch_info[1].item())
-                H_pad = int(patch_info[2].item())
-                W_pad = int(patch_info[3].item())
-                crop  = int(patch_info[4].item())
-
-                # reassemble predicted density map patches -> full image
-                pred_dm = (out_dm[1]                            # [P,1,h,w]
-                           .view(num_h, num_w, out_dm[1].shape[-2], out_dm[1].shape[-1])
-                           .permute(0, 2, 1, 3)
-                           .reshape(num_h * out_dm[1].shape[-2],
-                                    num_w * out_dm[1].shape[-1]))  # [H',W']
-
-                # reassemble GT kpoint map
-                gt_dm = (kpoint                                  # [P,1,crop,crop]
-                         .view(num_h, num_w, crop, crop)
-                         .permute(0, 2, 1, 3)
-                         .reshape(H_pad, W_pad))
-
-                def _to_heatmap(t, blur_sigma=0):
-                    """Normalise a 2D tensor and convert to a red heatmap CHW image."""
-                    import torch.nn.functional as F
-                    t = t.float().cpu()
-                    if blur_sigma > 0:
-                        # Gaussian blur to make sparse dots visible
-                        ks = int(blur_sigma * 6) | 1  # odd kernel
-                        coords = torch.arange(ks).float() - ks // 2
-                        kernel = torch.exp(-0.5 * (coords / blur_sigma) ** 2)
-                        kernel = kernel / kernel.sum()
-                        k2d = (kernel.unsqueeze(0) * kernel.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
-                        t = F.conv2d(t.unsqueeze(0).unsqueeze(0),
-                                     k2d, padding=ks // 2).squeeze()
-                    mn, mx = t.min(), t.max()
-                    t = (t - mn) / (mx - mn + 1e-8)
-                    return torch.stack([t, torch.zeros_like(t), 1.0 - t], dim=0)  # R,G,B
-
-                writer.add_image('val/dm_pred', _to_heatmap(pred_dm, blur_sigma=4), epoch)
-                writer.add_image('val/dm_gt',   _to_heatmap(gt_dm,   blur_sigma=8), epoch)
-                # also log raw input image (first patch, unnormalised)
-                raw_patch = img[0].cpu()
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
-                std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
-                raw_patch = (raw_patch * std + mean).clamp(0, 1)
-                writer.add_image('val/input_patch', raw_patch, epoch)
 
             # ----- precision / recall via point matching -----
             # GT points from kpoint patches -> reassemble full padded map -> (y, x) coords
@@ -470,25 +483,39 @@ def main(
             # undo padding offset
             gt_pts = gt_yx - torch.tensor([[pad_h, pad_w]], dtype=torch.float)
 
-            # Predicted points from DETR head (normalised x,y -> pixel y,x)
-            pred_logits = outputs['pred_logits'][0]
-            pred_pts_n  = outputs['pred_points'][0]   # [Q, 2] (x_norm, y_norm)
-            scores      = pred_logits.sigmoid()[:, 1]
-            keep        = scores > THRESHOLD
-            pred_xy     = pred_pts_n[keep].cpu()      # [M, 2]
-            # convert (x_norm, y_norm) -> pixel (y, x) in original image coords
+            # Predicted points from DETR head across ALL patches.
+            # outputs['pred_logits']: [P, Q, 2],  outputs['pred_points']: [P, Q, >=2]
+            # Patch layout: patches are ordered row-major (patch_row * num_w + patch_col).
+            # Padding was added to LEFT and TOP (dataset.py: F.pad(img,(pad_w,0,pad_h,0))),
+            # so patch origin in padded image is (row*crop, col*crop), and to convert to
+            # original-image coords we subtract the padding.
             orig_H = H_pad - pad_h
             orig_W = W_pad - pad_w
-            pred_pts = torch.stack([pred_xy[:, 1] * orig_H,
-                                    pred_xy[:, 0] * orig_W], dim=1)
+            all_pred_pts = []
+            for p_idx in range(num_h * num_w):
+                p_scores = outputs['pred_logits'][p_idx].sigmoid()[:, 1].cpu()
+                keep     = p_scores > THRESHOLD
+                pts_norm = outputs['pred_points'][p_idx][keep].cpu()[:, :2]  # (x_norm, y_norm)
+                patch_row = p_idx // num_w
+                patch_col = p_idx  % num_w
+                # origin in padded image (pixels)
+                oy = patch_row * crop   # y offset (includes pad_h at top)
+                ox = patch_col * crop   # x offset (includes pad_w at left)
+                # convert to original-image (y, x) by subtracting padding
+                py = oy + pts_norm[:, 1] * crop - pad_h  # y_norm * crop + row_origin - pad_h
+                px = ox + pts_norm[:, 0] * crop - pad_w  # x_norm * crop + col_origin - pad_w
+                # keep only points inside original image bounds
+                inside = (py >= 0) & (py < orig_H) & (px >= 0) & (px < orig_W)
+                if inside.any():
+                    all_pred_pts.append(torch.stack([py[inside], px[inside]], dim=1))
+            pred_pts = torch.cat(all_pred_pts, dim=0) if all_pred_pts else torch.zeros((0, 2))
 
-            # ----- debug overlay images (first sample only) -----
+            # ----- per-epoch image logging to TensorBoard (first sample only) -----
             if not debug_saved:
                 debug_saved = True
                 import PIL.Image as PILImage, PIL.ImageDraw as PILDraw
-                from pathlib import Path
 
-                # Reconstruct full image from patches (unnormalize then stitch)
+                # Unnormalize and stitch patches -> full original image
                 _mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
                 _std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
                 img_un = (img.cpu() * _std + _mean).clamp(0, 1)  # [P, 3, crop, crop]
@@ -496,28 +523,31 @@ def main(
                             .view(num_h, num_w, 3, crop, crop)
                             .permute(2, 0, 3, 1, 4)
                             .reshape(3, num_h * crop, num_w * crop))
-                img_orig = img_grid[:, :orig_H, :orig_W]  # [3, H, W]
+                img_orig = img_grid[:, pad_h:, pad_w:]     # [3, H, W] — strip top/left padding
                 img_np = (img_orig.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-                def _draw_pts(base_np, pts_yx, color_rgba, radius=8):
+                def _draw_pts(base_np, pts_yx, color, radius=8, outline_only=False):
                     base    = PILImage.fromarray(base_np).convert('RGBA')
                     overlay = PILImage.new('RGBA', base.size, (0, 0, 0, 0))
                     draw    = PILDraw.Draw(overlay)
                     for y, x in pts_yx:
                         y, x = int(y), int(x)
-                        draw.ellipse([x - radius, y - radius, x + radius, y + radius],
-                                     fill=color_rgba)
+                        bbox = [x - radius, y - radius, x + radius, y + radius]
+                        if outline_only:
+                            draw.ellipse(bbox, outline=color, width=2)
+                        else:
+                            draw.ellipse(bbox, fill=color)
                     return PILImage.alpha_composite(base, overlay).convert('RGB')
 
-                dbg_dir = Path(save_path) / 'debug_overlays'
-                dbg_dir.mkdir(parents=True, exist_ok=True)
                 gt_np   = gt_pts.numpy()   if gt_pts.numel()   > 0 else np.zeros((0, 2))
                 pred_np = pred_pts.numpy() if pred_pts.numel() > 0 else np.zeros((0, 2))
-                _draw_pts(img_np, gt_np,   (0, 220, 0,   160), radius=8).save(
-                    dbg_dir / f'epoch{epoch:04d}_gt.jpg')
-                _draw_pts(img_np, pred_np, (220, 50, 50, 160), radius=8).save(
-                    dbg_dir / f'epoch{epoch:04d}_pred.jpg')
-                logger.info(f'  Debug overlays: {len(gt_np)} GT, {len(pred_np)} pred -> {dbg_dir}')
+
+                # Single image: GT (green filled) + preds (red hollow) overlaid
+                combined = _draw_pts(img_np, gt_np,   (0, 220, 0,   200), radius=8, outline_only=False)
+                combined = _draw_pts(np.array(combined), pred_np, (220, 50, 50, 255), radius=8, outline_only=True)
+                img_tensor = torch.from_numpy(np.array(combined)).float().div(255).permute(2, 0, 1)
+                writer.add_image('val_img/gt_and_pred', img_tensor, epoch)
+                logger.info(f'  Logged val image: {len(gt_np)} GT pts, {len(pred_np)} pred pts')
 
             n_gt   = gt_pts.shape[0]
             n_pred = pred_pts.shape[0]
@@ -548,13 +578,13 @@ def main(
         f1        = (2 * precision * recall / (precision + recall)
                      if (precision + recall) > 0 else 0.0)
 
-        writer.add_scalar('val/MAE',       mae,       epoch)
-        writer.add_scalar('val/MSE',       mse,       epoch)
+        writer.add_scalar('val/dm_count_mae',  mae,       epoch)
+        writer.add_scalar('val/dm_count_rmse', mse,       epoch)
         writer.add_scalar('val/precision', precision, epoch)
         writer.add_scalar('val/recall',    recall,    epoch)
         writer.add_scalar('val/f1',        f1,        epoch)
-        msg = (f'  --> Val  MAE={mae:.3f}  P={precision:.3f}  R={recall:.3f}'
-               f'  F1={f1:.3f}  best={best_mae:.3f}')
+        msg = (f'  --> Val  dm_MAE={mae:.3f}  dm_RMSE={mse:.3f}  '
+               f'P={precision:.3f}  R={recall:.3f}  F1={f1:.3f}  best={best_mae:.3f}')
         logger.info(msg)
         print(msg, flush=True)
         return mae, mse
@@ -567,10 +597,14 @@ def main(
 
     nonlocal_best_mae = best_mae
 
+    # Run a validation pass before any training so epoch-0 images are visible
+    if start_epoch == 0 and val_files:
+        validate(0)
+
     for epoch in range(start_epoch, epochs + 1):
         train_one_epoch(epoch)
 
-        if epoch % val_every == 0:
+        if epoch % val_every == 0 and val_files:
             mae, mse = validate(epoch)
 
             is_best           = mae < nonlocal_best_mae
