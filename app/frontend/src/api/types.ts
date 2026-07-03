@@ -25,6 +25,30 @@ export interface DBCrop {
   created_at:  string
 }
 
+export interface DBVideoFrame {
+  id:               number
+  uuid:             string
+  source_file_id:   number
+  frame_number:     number
+  split:            Split
+  frame_rel_path:   string | null
+  motion_rel_path:  string | null
+  labeled_at:       string | null
+  created_at:       string
+}
+
+export interface VideoInfo {
+  id:            number
+  original_name: string
+  total_frames:  number
+  fps:           number
+}
+
+export interface VideoFile extends DBFile {
+  total_frames: number
+  fps:          number
+}
+
 export interface CropsPage     { items: DBCrop[]; total: number; offset: number; limit: number }
 export interface AnnotationData { file_id?: number; crop_id?: number; points: [number, number][] }
 export interface ScanResult    { added: number; skipped: number }

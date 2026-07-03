@@ -1,5 +1,5 @@
 import type {
-  DBFile, DBCrop, CropsPage, AnnotationData,
+  DBFile, DBCrop, DBVideoFrame, VideoFile, CropsPage, AnnotationData,
   ScanResult, AssignResult, CropResult, ExtractResult, Split,
 } from './types'
 
@@ -101,4 +101,32 @@ export const api = {
 
   commitCropAnnotation: (cropId: number) =>
     req<{ ok: boolean; points: number; path: string }>(`/label/crops/${cropId}/commit`, { method: 'POST' }),
+
+  // ---- Video frame annotation ----
+  listVideos: () =>
+    req<VideoFile[]>('/video'),
+
+  videoInfo: (fileId: number) =>
+    req<{ id: number; original_name: string; total_frames: number; fps: number }>(`/video/${fileId}/info`),
+
+  videoFrameUrl: (fileId: number, frameNumber: number, mode: 'raw' | 'bg_sub' = 'raw') =>
+    `/api/video/${fileId}/frame?n=${frameNumber}&mode=${mode}`,
+
+  videoStreamUrl: (fileId: number) =>
+    `/api/video/${fileId}/stream`,
+
+  commitVideoFrame: (fileId: number, frameNumber: number, split: Split, points: [number, number][]) =>
+    req<{ ok: boolean; uuid: string; frame: string; motion: string | null; points: number }>(
+      `/video/${fileId}/frame/${frameNumber}/commit`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ split, points }),
+      }
+    ),
+
+  listVideoFrames: (fileId: number, split?: Split) => {
+    const qs = split ? `?split=${split}` : ''
+    return req<DBVideoFrame[]>(`/video/${fileId}/frames${qs}`)
+  },
 }

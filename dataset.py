@@ -9,6 +9,35 @@ from PIL import Image
 import numpy as np
 
 
+def _load_companion_pil(img_path: str, mode: str):
+    """Load the companion image (prev10 or background) for a given frame path.
+    Returns a PIL Image or None if the companion file does not exist.
+    """
+    if not mode:
+        return None
+    stem, ext = os.path.splitext(img_path)
+    comp_path = f"{stem}_{mode}{ext}"
+    if os.path.exists(comp_path):
+        return Image.open(comp_path).convert('RGB')
+    return None
+
+
+def _cat_companion(img_tensor, companion_pil, companion_mode, transform):
+    """Concatenate companion image to the main image tensor along channels.
+    Returns a [6, H, W] tensor (or [3, H, W] if companion_mode is falsy).
+    """
+    if not companion_mode:
+        return img_tensor
+    if companion_pil is not None:
+        # Resize companion to match the (possibly scaled/augmented) main image tensor
+        h, w = img_tensor.shape[1], img_tensor.shape[2]
+        comp_resized = companion_pil.resize((w, h), Image.BILINEAR)
+        comp_t = transform(comp_resized)          # PIL → normalised tensor [3, H, W]
+    else:
+        comp_t = torch.zeros_like(img_tensor)    # companion missing → zeros
+    return torch.cat([img_tensor, comp_t], dim=0)  # [6, H, W]
+
+
 def gen_discrete_map(im_height, im_width, points):
     """
         func: generate the discrete map.
@@ -97,11 +126,16 @@ class listDataset(Dataset):
             fname = os.path.basename(img_path)
             img, kpoint = load_data(img_path, self.args, self.train)
 
+        companion_mode = self.args.get('companion_mode', None)
+        companion_pil  = _load_companion_pil(img_path, companion_mode)
+
         '''data augmention'''
         if self.train == True:
             if random.random() > 0.5:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 kpoint = np.fliplr(kpoint)
+                if companion_pil is not None:
+                    companion_pil = companion_pil.transpose(Image.FLIP_LEFT_RIGHT)
 
             if self.args['scale_aug'] == True and random.random() > (1 - self.args['scale_p']): # random scale
                 if self.args['scale_type'] == 0:
@@ -115,6 +149,8 @@ class listDataset(Dataset):
                 height = int(height * self.rate)
                 if min(width, height) > self.args['crop_size']:
                     img = img.resize((width, height), Image.LANCZOS)
+                    if companion_pil is not None:
+                        companion_pil = companion_pil.resize((width, height), Image.LANCZOS)
                 else:
                     self.rate = 1
             else:
@@ -125,6 +161,7 @@ class listDataset(Dataset):
 
         if self.transform is not None:
             img = self.transform(img)
+        img = _cat_companion(img, companion_pil, companion_mode, self.transform)
 
 
         if self.train == True:
@@ -138,10 +175,12 @@ class listDataset(Dataset):
                         img_path = self.lines[random.randint(1, self.nSamples-1)]
                         fname = os.path.basename(img_path)
                         img, kpoint = load_data(img_path, self.args, self.train)
+                        companion_pil = _load_companion_pil(img_path, companion_mode)
 
                         count_none = 0
                         if self.transform is not None:
                             img = self.transform(img)
+                        img = _cat_companion(img, companion_pil, companion_mode, self.transform)
                         self.rate = 1
 
                     width = self.args['crop_size']
@@ -172,12 +211,14 @@ class listDataset(Dataset):
 
                     #points = gt_points
                     # added by gls
-                    gt_points_scale=gt_points/float(width)*self.args['crop_size']
-                    # print(gt_points_scale.shape, gt_points_scale.dtype);print(gt_points_scale[0,:]);exit()
-                    assert gt_points_scale.dim()==2
-                    gt_points_scale=torch.flip(gt_points_scale, [1])
-                    discrete_map=gen_discrete_map(self.args['crop_size'], self.args['crop_size'],gt_points_scale)
-
+                    # gt_points: [N, 2] in (row=y, col=x) order from np.nonzero
+                    # scale to the actual patch size the model sees (crop_size), NOT the
+                    # un-scaled sub_kpoint size (width = crop_size/rate when scale_aug fires)
+                    gt_points_scale = gt_points / float(width) * self.args['crop_size']
+                    assert gt_points_scale.dim() == 2
+                    # flip to (x, y) / (col, row) for the density map generator
+                    gt_points_scale_xy = torch.flip(gt_points_scale, [1])
+                    discrete_map = gen_discrete_map(self.args['crop_size'], self.args['crop_size'], gt_points_scale_xy)
 
                     if num_points > self.args['min_num'] and num_points < self.args['num_queries']:
                         break
@@ -186,10 +227,18 @@ class listDataset(Dataset):
 
                 target['labels'] = torch.ones([1, num_points]).squeeze(0).type(torch.LongTensor)
                 target['points_macher'] = torch.true_divide(points, width).type(torch.FloatTensor)
-                target['points'] = torch.true_divide(points[:, 0:self.args['channel_point']], width).type(torch.FloatTensor)
-                # added by gls
+                # points[:, 0] = row (y), points[:, 1] = col (x).
+                # Normalise by crop_size (the model patch size) and flip to (x_norm, y_norm)
+                # so that target['points'] matches pred_points format from the DETR head.
+                pts_yx = points[:, 0:2] / float(self.args['crop_size'])   # (y_norm, x_norm)
+                if self.args['channel_point'] >= 3:
+                    dist_norm = points[:, 2:3] / float(self.args['crop_size'])
+                    pts_xy_with_dist = torch.cat([pts_yx[:, 1:2], pts_yx[:, 0:1], dist_norm], dim=1)
+                    target['points'] = pts_xy_with_dist.type(torch.FloatTensor)
+                else:
+                    target['points'] = torch.stack([pts_yx[:, 1], pts_yx[:, 0]], dim=1).type(torch.FloatTensor)
                 target['gt_map'] = torch.from_numpy(discrete_map).unsqueeze(0)
-                target['points_true'] = gt_points_scale.type(torch.FloatTensor)
+                target['points_true'] = gt_points_scale_xy.type(torch.FloatTensor)
                 # target['points_true'] = torch.flip(gt_points_scale, [1]).type(torch.FloatTensor)
                 # print("sub_kpoint shape: ", sub_kpoint.shape, sub_img.shape, img.shape, kpoint.shape)
 
@@ -220,9 +269,10 @@ class listDataset(Dataset):
             num_h = int(height / self.args['crop_size'])
 
             '''image to patch'''
-            img_return = img.view(3, num_h, self.args['crop_size'], width).view(3, num_h, self.args['crop_size'], num_w,
+            C = img.shape[0]  # 3 (no companion) or 6 (with companion)
+            img_return = img.view(C, num_h, self.args['crop_size'], width).view(C, num_h, self.args['crop_size'], num_w,
                                                                                 self.args['crop_size'])
-            img_return = img_return.permute(0, 1, 3, 2, 4).contiguous().view(3, num_w * num_h, self.args['crop_size'],
+            img_return = img_return.permute(0, 1, 3, 2, 4).contiguous().view(C, num_w * num_h, self.args['crop_size'],
                                                                              self.args['crop_size']).permute(1, 0, 2, 3)
 
             kpoint_return = kpoint.view(num_h, self.args['crop_size'], width).view(num_h, self.args['crop_size'], num_w,

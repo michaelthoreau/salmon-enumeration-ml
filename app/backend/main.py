@@ -12,9 +12,11 @@ from config import DATA_ROOT, INPUT_IMAGES_DIR, INPUT_VIDEOS_DIR, PORT, SPLITS
 from db.client import create_db_and_tables
 from routes.crops import router as crops_router
 from routes.files import router as files_router
+from routes.infer import router as infer_router
 from routes.label import router as label_router
 from routes.scan import router as scan_router
 from routes.serve import router as serve_router
+from routes.video import router as video_router
 
 
 def _migrate(engine):
@@ -31,6 +33,13 @@ def _migrate(engine):
         # Add crop_id to annotations if missing
         try:
             conn.execute(text("ALTER TABLE annotations ADD COLUMN crop_id INTEGER"))
+            conn.commit()
+        except Exception:
+            pass
+
+        # Add background_rel_path to video_frames if missing
+        try:
+            conn.execute(text("ALTER TABLE video_frames ADD COLUMN background_rel_path TEXT"))
             conn.commit()
         except Exception:
             pass
@@ -88,6 +97,8 @@ app.include_router(files_router, prefix="/api")
 app.include_router(crops_router, prefix="/api")
 app.include_router(label_router, prefix="/api")
 app.include_router(serve_router, prefix="/api")
+app.include_router(infer_router, prefix="/api")
+app.include_router(video_router, prefix="/api")
 
 
 if __name__ == "__main__":

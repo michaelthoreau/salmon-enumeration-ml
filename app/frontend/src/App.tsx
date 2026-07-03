@@ -1,9 +1,11 @@
 import { createBrowserRouter, RouterProvider, NavLink, Navigate, Outlet } from 'react-router-dom'
-import InputPage    from './pages/InputPage'
-import RawPage      from './pages/RawPage'
-import UnlabeledPage from './pages/UnlabeledPage'
-import LabelPage    from './pages/LabelPage'
-import LabeledPage  from './pages/LabeledPage'
+import InputPage          from './pages/InputPage'
+import RawPage            from './pages/RawPage'
+import UnlabeledPage      from './pages/UnlabeledPage'
+import LabelPage          from './pages/LabelPage'
+import LabeledPage        from './pages/LabeledPage'
+import InferencePage      from './pages/InferencePage'
+import VideoAnnotatePage  from './pages/VideoAnnotatePage'
 
 const nav = [
   { to: '/input',         label: 'Input' },
@@ -11,7 +13,9 @@ const nav = [
   { to: '/raw/val',       label: 'Val Raw' },
   { to: '/raw/test',      label: 'Test Raw' },
   { to: '/label',         label: 'Label' },
+  { to: '/video-annotate', label: 'Video' },
   { to: '/labeled',       label: 'Labeled' },
+  { to: '/infer',         label: 'Inference' },
 ]
 
 function Layout() {
@@ -52,9 +56,11 @@ const router = createBrowserRouter([
       { index: true,          element: <Navigate to="/input" replace /> },
       { path: 'input',        element: <InputPage /> },
       { path: 'raw/:split',   element: <RawPage /> },
-      { path: 'label',        element: <LabelPage /> },
-      { path: 'labeled',      element: <LabeledPage /> },
-      { path: 'unlabeled',    element: <UnlabeledPage /> },
+      { path: 'label',           element: <LabelPage /> },
+      { path: 'video-annotate',  element: <VideoAnnotatePage /> },
+      { path: 'labeled',         element: <LabeledPage /> },
+      { path: 'infer',           element: <InferencePage /> },
+      { path: 'unlabeled',       element: <UnlabeledPage /> },
     ],
   },
 ])

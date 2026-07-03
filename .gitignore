@@ -5,3 +5,4 @@ data
 data_bigapp/node_modules/
 app/frontend/node_modules
 app/node_modules/
+node_modules
