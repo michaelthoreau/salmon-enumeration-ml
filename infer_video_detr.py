@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import glob
 from collections import deque
 from pathlib import Path
 
@@ -215,7 +217,7 @@ def _infer_batch(
     img_size: int,
     score_thresh: float,
     iou_thresh: float,
-    tile_batch_size: int = 2,
+    tile_batch_size: int = 16,
 ) -> list[list[tuple[int, int, float, float, float, float, float]]]:
     """
     Infer on multiple frames.  Tiles are collected across all frames and sent
@@ -284,8 +286,13 @@ def _infer_batch(
 def _draw_centroids(frame: np.ndarray, centroids: list, radius: int = 6) -> np.ndarray:
     frame = frame.copy()
     for item in centroids:
-        # item is (cx, cy, track_id, prev_pos)
-        x, y, track_id, prev_pos = item
+        if isinstance(item, dict):
+            x = item["cx"]
+            y = item["cy"]
+            track_id = item["track_id"]
+            prev_pos = item.get("prev_pos", None)
+        else:
+            x, y, track_id, prev_pos = item
         
         if prev_pos is not None:
             px, py = prev_pos
@@ -438,152 +445,395 @@ def _draw_count_graph(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Pipeline Wrapper
 # ---------------------------------------------------------------------------
 
-def main(
-    checkpoint: str,
-    video: str,
-    output: str         = None,
-    img_size: int       = 512,
-    score_thresh: float = 0.35,
-    iou_thresh: float   = 0.5,
-    num_queries: int    = 100,
-    companion_mode: str = None,   # 'prev10' | 'background' | None
-    ma_window: int      = 30,     # moving-average window (frames)
-    graph_height: int   = 280,
-    graph_width: int    = 700,
-    dot_radius: int     = 6,
-    max_frames: int     = 0,
-    infer_every: int    = 1,
-    batch_frames: int   = 1,
-    tile_batch_size: int = 2,      # tiles per GPU forward pass; raise if VRAM allows
-    traverse_seconds: float = 25.0,
-):
-    """
-    Run the DETR model on a video and produce an annotated output video.
+class Pipeline:
+    def detect(
+        self,
+        checkpoint: str,
+        video: str,
+        output_json: str | None = None,
+        start_sec: float = 0.0,
+        duration_sec: float | None = None,
+        img_size: int = 512,
+        score_thresh: float = 0.35,
+        iou_thresh: float = 0.5,
+        num_queries: int = 100,
+        companion_mode: str | None = None,  # 'prev10' | 'background' | None
+        batch_frames: int = 1,
+        tile_batch_size: int = 16,
+        infer_every: int = 1,
+        detect_height: int | None = None
+    ) -> dict:
+        """
+        Stage 1: GPU-bound inference. Processes video from start_sec to start_sec+duration_sec,
+        computes bounding boxes, and returns them. Also saves them to output_json if provided.
+        """
+        video_path = Path(video)
+        
+        # ---- load model ----
+        print(f'Loading checkpoint: {checkpoint}')
+        model = load_model(checkpoint, num_queries, companion_mode)
+        print(f'Model loaded  |  companion_mode={companion_mode}  |  img_size={img_size}')
 
-    Args:
-        checkpoint:     Path to best.pth checkpoint.
-        video:          Input video path.
-        output:         Output video path. Defaults to <input>_annotated.mp4.
-        img_size:       Tile size — must match training.
-        score_thresh:   Confidence threshold for detections.
-        iou_thresh:     NMS IoU threshold.
-        num_queries:    DETR query count — must match training.
-        companion_mode: 'prev10' | 'background' | None.
-                        For 'prev10', uses the frame 10 positions earlier as the companion.
-        ma_window:      Moving-average window for the count graph (frames).
-        graph_height:   Height of the count-graph overlay in pixels.
-        graph_width:    Width of the count-graph overlay in pixels.
-        dot_radius:     Radius of predicted-centroid dots.
-        infer_every:        Run inference on one frame in every N. Skips writing intermediate frames.
-        traverse_seconds:   Time (s) for one fish to traverse the frame top-to-bottom.
-                            Used to convert instantaneous count to hourly escapement.
-                            hourly_escapement = moving_avg_count × (3600 / traverse_seconds)
-    """
-    video_path = Path(video)
-    if output is None:
-        output = str(video_path.with_name(video_path.stem + '_annotated.mp4'))
+        # ---- open video ----
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f'Cannot open video: {video_path}')
 
-    # ---- load model ----
-    print(f'Loading checkpoint: {checkpoint}')
-    model = load_model(checkpoint, num_queries, companion_mode)
-    print(f'Model loaded  |  companion_mode={companion_mode}  |  img_size={img_size}')
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w_vid        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h_vid        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        start_frame = int(start_sec * fps)
+        if duration_sec is not None:
+            n_to_process = int(duration_sec * fps)
+            end_frame = min(start_frame + n_to_process, total_frames)
+        else:
+            end_frame = total_frames
+            n_to_process = end_frame - start_frame
 
-    # ---- open video ----
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f'Cannot open video: {video_path}')
+        # Resizing configuration
+        scale = None
+        if detect_height is not None and detect_height < h_vid:
+            scale = detect_height / h_vid
+            detect_w = int(w_vid * scale)
+            detect_h = detect_height
+            print(f'Resizing video frames from {w_vid}x{h_vid} to {detect_w}x{detect_h} for inference (scale={scale:.4f})')
+        else:
+            scale = None
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    w_vid        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h_vid        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_to_process = total_frames if max_frames <= 0 else min(max_frames, total_frames)
+        print(f'Video: {video_path.name}  {w_vid}×{h_vid}  {fps:.2f} fps  '
+              f'Frames {start_frame} → {end_frame} ({n_to_process} frames)')
 
-    print(f'Video: {video_path.name}  {w_vid}×{h_vid}  {fps:.2f} fps  '
-          f'{total_frames} frames  → processing {n_to_process}')
+        # ---- frame buffer for companion ----
+        PREV_OFFSET    = 10
+        frame_buffer: deque[np.ndarray] = deque(maxlen=PREV_OFFSET + 1)
+        
+        # Pre-populate companion buffer if starting in the middle
+        if companion_mode == 'prev10' and start_frame > 0:
+            buffer_start = max(0, start_frame - PREV_OFFSET)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, buffer_start)
+            for _ in range(start_frame - buffer_start):
+                ok, f = cap.read()
+                if not ok:
+                    break
+                frame_buffer.append(f)
 
-    # ---- video writer (always at input FPS) ----
-    fourcc     = cv2.VideoWriter_fourcc(*'mp4v')
-    output_fps = fps
-    writer     = cv2.VideoWriter(output, fourcc, output_fps, (w_vid, h_vid))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    # ---- frame buffer for companion ----
-    # For 'prev10': companion is frame i-10 (or frame 0 if not yet accumulated)
-    PREV_OFFSET    = 10
-    frame_buffer: deque[np.ndarray] = deque(maxlen=PREV_OFFSET + 1)
+        # ---- process in batched blocks ----
+        block_size      = batch_frames * max(infer_every, 1)
+        frame_block:    list[tuple[np.ndarray, np.ndarray | None]] = []
+        infer_in_block: list[tuple[np.ndarray, np.ndarray | None, int]] = []
+        
+        detections_out = {}
 
-    # ---- count history for graph ----
-    count_history: deque[int] = deque(maxlen=max(ma_window * 3, 90))
+        pbar = tqdm(total=n_to_process, desc='Detecting', unit='frame', ncols=100)
 
-    # ---- process in batched blocks ----
-    # Each block = batch_frames × infer_every frames.
-    # Inference frames within a block are batched into one GPU forward pass,
-    # then the entire block is written in temporal order.
-    block_size      = batch_frames * max(infer_every, 1)
-    frame_block:    list[tuple[np.ndarray, np.ndarray | None]] = []
-    infer_in_block: list[tuple[np.ndarray, np.ndarray | None, int]] = []
-    last_centroids: list = []
-    last_count: int      = 0
-    last_mean_speed: float = 0.0
-    last_mean_vector: np.ndarray | None = None
+        def _write_block():
+            # If scaling is requested, resize frames in memory before inference
+            frames_to_infer = []
+            for f, c, _ in infer_in_block:
+                if scale is not None:
+                    f_resized = cv2.resize(f, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR)
+                    c_resized = cv2.resize(c, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR) if c is not None else None
+                    frames_to_infer.append((f_resized, c_resized))
+                else:
+                    frames_to_infer.append((f, c))
 
-    # ---- initialize tracker ----
-    tracker = BYTETracker(track_thresh=score_thresh, track_buffer=ma_window)
+            batch_results = (_infer_batch(model, frames_to_infer,
+                                          img_size, score_thresh, iou_thresh,
+                                          tile_batch_size=tile_batch_size)
+                              if infer_in_block else [])
+            infer_by_pos = {pos: res for (_, _, pos), res in zip(infer_in_block, batch_results)}
 
-    pbar = tqdm(total=n_to_process, desc='Inferring', unit='frame', ncols=100)
-
-    def _write_block():
-        nonlocal last_centroids, last_count, last_mean_speed, last_mean_vector
-        batch_results = (_infer_batch(model, [(f, c) for f, c, _ in infer_in_block],
-                                      img_size, score_thresh, iou_thresh,
-                                      tile_batch_size=tile_batch_size)
-                          if infer_in_block else [])
-        infer_by_pos = {pos: res for (_, _, pos), res in zip(infer_in_block, batch_results)}
-
-        for pos, (frame_bgr, _) in enumerate(frame_block):
-            abs_frame_idx = frame_idx - len(frame_block) + pos
-            if pos in infer_by_pos:
-                detections = infer_by_pos[pos]  # list of (cx, cy, x1, y1, x2, y2, score)
-                tracker_inputs = [[d[2], d[3], d[4], d[5], d[6]] for d in detections]
-                
-                # Update tracker
-                tracker.frame_id = abs_frame_idx
-                active_tracks = tracker.update(tracker_inputs)
-                
-                # Extract centroids
-                last_centroids = []
-                motion_vectors = []
-                for track in active_tracks:
-                    cx = int((track.tlbr[0] + track.tlbr[2]) / 2)
-                    cy = int((track.tlbr[1] + track.tlbr[3]) / 2)
-                    
-                    # Compute motion vector and retrieve historical position
-                    mv_res = get_motion_vector(track, abs_frame_idx, fps)
-                    if mv_res is not None:
-                        mv, cx_prev, cy_prev = mv_res
-                        motion_vectors.append(mv)
-                        last_centroids.append((cx, cy, track.track_id, (int(cx_prev), int(cy_prev))))
+            for pos, _ in enumerate(frame_block):
+                abs_frame_idx = frame_idx - len(frame_block) + pos
+                if pos in infer_by_pos:
+                    detections = infer_by_pos[pos]
+                    if scale is not None:
+                        # Scale bounding box coordinates back to original video pixels
+                        detections_out[abs_frame_idx] = [
+                            [
+                                round(d[2] / scale, 2),
+                                round(d[3] / scale, 2),
+                                round(d[4] / scale, 2),
+                                round(d[5] / scale, 2),
+                                round(d[6], 4)
+                            ]
+                            for d in detections
+                        ]
                     else:
-                        last_centroids.append((cx, cy, track.track_id, None))
-                        
-                # Outlier rejection & average speed/direction
-                if len(motion_vectors) > 0:
-                    filtered_vectors = reject_outliers_iqr(motion_vectors)
-                    if len(filtered_vectors) > 0:
-                        speeds = np.linalg.norm(filtered_vectors, axis=1)
-                        last_mean_speed = float(np.mean(speeds))
-                        last_mean_vector = np.mean(filtered_vectors, axis=0)
-                    else:
-                        last_mean_speed = 0.0
-                        last_mean_vector = None
+                        detections_out[abs_frame_idx] = [
+                            [round(d[2], 2), round(d[3], 2), round(d[4], 2), round(d[5], 2), round(d[6], 4)]
+                            for d in detections
+                        ]
+                pbar.update(1)
+
+        frame_idx = start_frame
+        while frame_idx < end_frame:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+
+            frame_buffer.append(frame_bgr)
+            companion_bgr = frame_buffer[0] if companion_mode == 'prev10' else None
+
+            block_pos = len(frame_block)
+            frame_block.append((frame_bgr, companion_bgr))
+            if (frame_idx - start_frame) % infer_every == 0:
+                infer_in_block.append((frame_bgr, companion_bgr, block_pos))
+
+            frame_idx += 1
+
+            if len(frame_block) >= block_size:
+                _write_block()
+                frame_block.clear()
+                infer_in_block.clear()
+
+        if frame_block:   # flush remainder
+            _write_block()
+
+        pbar.close()
+        cap.release()
+
+        out_data = {
+            "video_path": video,
+            "fps": fps,
+            "width": w_vid,
+            "height": h_vid,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "infer_every": infer_every,
+            "detections": detections_out
+        }
+
+        if output_json is not None:
+            output_json_path = Path(output_json)
+            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_json_path, 'w') as f:
+                json.dump(out_data, f)
+            print(f"Saved detections to {output_json}")
+
+        return out_data
+
+    def track(
+        self,
+        detection_jsons: list[str] | str | dict,
+        output_track_json: str | None = None,
+        track_thresh: float = 0.35,
+        min_box_score: float = 0.1,
+        ma_window: int = 30
+    ) -> dict:
+        """
+        Stage 2: CPU-bound tracking. Loads and merges bounding boxes from one or more
+        detection files/dicts, runs the BYTETracker, filters outliers, and computes paths + metrics.
+        """
+        video_path = None
+        fps = 30.0
+        width = 1920
+        height = 1080
+        merged_detections = {}
+
+        if isinstance(detection_jsons, dict):
+            video_path = detection_jsons.get("video_path")
+            fps = detection_jsons.get("fps", 30.0)
+            width = detection_jsons.get("width", 1920)
+            height = detection_jsons.get("height", 1080)
+            for k, v in detection_jsons.get("detections", {}).items():
+                merged_detections[int(k)] = v
+        else:
+            files_to_load = []
+            if isinstance(detection_jsons, str):
+                if "*" in detection_jsons or "?" in detection_jsons:
+                    files_to_load = sorted(glob.glob(detection_jsons))
+                else:
+                    files_to_load = [p.strip() for p in detection_jsons.split(",") if p.strip()]
+            elif isinstance(detection_jsons, list):
+                files_to_load = detection_jsons
+
+            if not files_to_load:
+                raise ValueError("No detection inputs provided.")
+
+            print(f"Loading and merging {len(files_to_load)} detection file(s)...")
+            for idx, file_path in enumerate(files_to_load):
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                if idx == 0:
+                    video_path = data.get("video_path")
+                    fps = data.get("fps", 30.0)
+                    width = data.get("width", 1920)
+                    height = data.get("height", 1080)
+                for k, v in data.get("detections", {}).items():
+                    merged_detections[int(k)] = v
+
+        sorted_frame_indices = sorted(merged_detections.keys())
+        if not sorted_frame_indices:
+            print("Warning: No detections to track.")
+            
+        tracker = BYTETracker(track_thresh=track_thresh, track_buffer=ma_window, min_box_score=min_box_score)
+
+        tracks_data = {}
+        metrics_counts = {}
+        metrics_speeds = {}
+        metrics_directions = {}
+        
+        count_history = deque(maxlen=max(ma_window * 3, 90))
+        last_mean_speed = 0.0
+        last_mean_vector = None
+
+        print(f"Tracking over {len(sorted_frame_indices)} frames...")
+        
+        for frame_idx in tqdm(sorted_frame_indices, desc="Tracking", unit="frame", ncols=100):
+            detections = merged_detections[frame_idx]
+            tracker.frame_id = frame_idx
+            active_tracks = tracker.update(detections)
+
+            frame_centroids = []
+            motion_vectors = []
+            for track in active_tracks:
+                cx = int((track.tlbr[0] + track.tlbr[2]) / 2)
+                cy = int((track.tlbr[1] + track.tlbr[3]) / 2)
+
+                mv_res = get_motion_vector(track, frame_idx, fps)
+                if mv_res is not None:
+                    mv, cx_prev, cy_prev = mv_res
+                    motion_vectors.append(mv)
+                    prev_pos = [int(cx_prev), int(cy_prev)]
+                else:
+                    prev_pos = None
+
+                frame_centroids.append({
+                    "track_id": track.track_id,
+                    "cx": cx,
+                    "cy": cy,
+                    "prev_pos": prev_pos
+                })
+
+            if len(motion_vectors) > 0:
+                filtered_vectors = reject_outliers_iqr(motion_vectors)
+                if len(filtered_vectors) > 0:
+                    speeds = np.linalg.norm(filtered_vectors, axis=1)
+                    last_mean_speed = float(np.mean(speeds))
+                    last_mean_vector = np.mean(filtered_vectors, axis=0)
                 else:
                     last_mean_speed = 0.0
                     last_mean_vector = None
+            else:
+                last_mean_speed = 0.0
+                last_mean_vector = None
 
-                last_count = len(last_centroids)
+            tracks_data[frame_idx] = frame_centroids
+            metrics_counts[frame_idx] = len(frame_centroids)
+            metrics_speeds[frame_idx] = round(last_mean_speed, 2)
+            metrics_directions[frame_idx] = [round(float(v), 3) for v in last_mean_vector] if last_mean_vector is not None else None
+            count_history.append(len(frame_centroids))
+
+        out_data = {
+            "video_path": video_path,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "tracks": tracks_data,
+            "metrics": {
+                "frame_counts": metrics_counts,
+                "frame_speeds": metrics_speeds,
+                "frame_directions": metrics_directions
+            }
+        }
+
+        if output_track_json is not None:
+            output_track_path = Path(output_track_json)
+            output_track_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_track_path, 'w') as f:
+                json.dump(out_data, f)
+            print(f"Saved tracks to {output_track_json}")
+
+        return out_data
+
+    def render(
+        self,
+        track_json: str | dict,
+        video: str,
+        output_video: str | None = None,
+        start_sec: float = 0.0,
+        duration_sec: float | None = None,
+        graph_height: int = 280,
+        graph_width: int = 700,
+        dot_radius: int = 6,
+        traverse_seconds: float = 25.0,
+        ma_window: int = 30
+    ) -> str:
+        """
+        Stage 3: CPU/UI-bound rendering. Takes tracking JSON/dict and original video, 
+        applies all visual overlays, and saves to an annotated video.
+        """
+        if isinstance(track_json, dict):
+            track_data = track_json
+        else:
+            with open(track_json, 'r') as f:
+                track_data = json.load(f)
+
+        video_path = Path(video)
+        if output_video is None:
+            output_video = str(video_path.with_name(video_path.stem + '_annotated.mp4'))
+
+        # ---- open video ----
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f'Cannot open video: {video_path}')
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w_vid        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h_vid        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        start_frame = int(start_sec * fps)
+        if duration_sec is not None:
+            n_to_process = int(duration_sec * fps)
+            end_frame = min(start_frame + n_to_process, total_frames)
+        else:
+            end_frame = total_frames
+            n_to_process = end_frame - start_frame
+
+        print(f'Rendering video: {output_video}  ({n_to_process} frames)...')
+
+        fourcc     = cv2.VideoWriter_fourcc(*'mp4v')
+        writer     = cv2.VideoWriter(output_video, fourcc, fps, (w_vid, h_vid))
+
+        count_history = deque(maxlen=max(ma_window * 3, 90))
+        
+        tracks_dict = track_data.get("tracks", {})
+        metrics = track_data.get("metrics", {})
+        frame_counts = metrics.get("frame_counts", {})
+        frame_speeds = metrics.get("frame_speeds", {})
+        frame_directions = metrics.get("frame_directions", {})
+
+        last_centroids = []
+        last_mean_speed = 0.0
+        last_mean_vector = None
+        last_count = 0
+
+        pbar = tqdm(total=n_to_process, desc='Rendering', unit='frame', ncols=100)
+        
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        for frame_idx in range(start_frame, end_frame):
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+
+            f_key = str(frame_idx)
+            if f_key in tracks_dict:
+                last_centroids = tracks_dict[f_key]
+                last_mean_speed = frame_speeds.get(f_key, 0.0)
+                raw_dir = frame_directions.get(f_key, None)
+                last_mean_vector = np.array(raw_dir) if raw_dir is not None else None
+                
+                last_count = frame_counts.get(f_key, 0)
                 count_history.append(last_count)
 
             ma_val    = sum(count_history) / max(len(count_history), 1)
@@ -597,44 +847,161 @@ def main(
             out_frame = _draw_motion_panel(out_frame, last_mean_speed, len(last_centroids), last_mean_vector)
             writer.write(out_frame)
             pbar.update(1)
-        pbar.set_postfix(count=last_count,
-                         ma=f'{sum(count_history)/max(len(count_history),1):.1f}',
-                         speed=f'{last_mean_speed:.1f}')
 
-    frame_idx = 0
-    while frame_idx < n_to_process:
-        ok, frame_bgr = cap.read()
-        if not ok:
-            break
+        pbar.close()
+        cap.release()
+        writer.release()
+        
+        print(f'\nRender Done. Output: {output_video}')
+        return output_video
 
-        frame_buffer.append(frame_bgr)
-        companion_bgr = frame_buffer[0] if companion_mode == 'prev10' else None
+    def run_all(
+        self,
+        checkpoint: str,
+        video: str,
+        output: str | None = None,
+        start_sec: float = 0.0,
+        duration_sec: float | None = None,
+        img_size: int = 512,
+        score_thresh: float = 0.35,
+        iou_thresh: float = 0.5,
+        num_queries: int = 100,
+        companion_mode: str | None = None,
+        ma_window: int = 30,
+        graph_height: int = 280,
+        graph_width: int = 700,
+        dot_radius: int = 6,
+        infer_every: int = 1,
+        batch_frames: int = 1,
+        tile_batch_size: int = 16,
+        traverse_seconds: float = 25.0,
+        track_thresh: float = 0.35,
+        min_box_score: float = 0.1,
+        detect_height: int | None = None
+    ):
+        """
+        Run the entire pipeline (Detect -> Track -> Render) sequentially in memory.
+        """
+        print("=== STAGE 1: DETECTION ===")
+        detection_data = self.detect(
+            checkpoint=checkpoint, video=video, output_json=None,
+            start_sec=start_sec, duration_sec=duration_sec, img_size=img_size,
+            score_thresh=score_thresh, iou_thresh=iou_thresh, num_queries=num_queries,
+            companion_mode=companion_mode, batch_frames=batch_frames,
+            tile_batch_size=tile_batch_size, infer_every=infer_every,
+            detect_height=detect_height
+        )
 
-        block_pos = len(frame_block)
-        frame_block.append((frame_bgr, companion_bgr))
-        if frame_idx % infer_every == 0:
-            infer_in_block.append((frame_bgr, companion_bgr, block_pos))
+        print("\n=== STAGE 2: TRACKING ===")
+        t_thresh = track_thresh if track_thresh is not None else score_thresh
+        track_data = self.track(
+            detection_jsons=detection_data, output_track_json=None,
+            track_thresh=t_thresh, min_box_score=min_box_score, ma_window=ma_window
+        )
 
-        frame_idx += 1
+        print("\n=== STAGE 3: RENDERING ===")
+        self.render(
+            track_json=track_data, video=video, output_video=output,
+            start_sec=start_sec, duration_sec=duration_sec,
+            graph_height=graph_height, graph_width=graph_width,
+            dot_radius=dot_radius, traverse_seconds=traverse_seconds,
+            ma_window=ma_window
+        )
 
-        if len(frame_block) >= block_size:
-            _write_block()
-            frame_block.clear()
-            infer_in_block.clear()
+    def detect_parallel(
+        self,
+        checkpoint: str,
+        video: str,
+        output_dir: str,
+        num_workers: int = 2,
+        start_sec: float = 0.0,
+        duration_sec: float | None = None,
+        img_size: int = 512,
+        score_thresh: float = 0.35,
+        iou_thresh: float = 0.5,
+        num_queries: int = 100,
+        companion_mode: str | None = None,
+        batch_frames: int = 1,
+        tile_batch_size: int = 16,
+        infer_every: int = 1,
+        detect_height: int | None = None
+    ):
+        """
+        Splits the video duration (or specified slice) into equal chunks and processes them
+        in parallel using multiprocessing workers. Detections are saved to output_dir.
+        """
+        import multiprocessing
+        
+        cap = cv2.VideoCapture(video)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video}")
+            
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        
+        video_duration = total_frames / fps
+        if duration_sec is not None:
+            slice_duration = min(duration_sec, video_duration - start_sec)
+        else:
+            slice_duration = video_duration - start_sec
+            
+        chunk_duration = slice_duration / num_workers
+        
+        print(f"Parallel Detection: splitting {slice_duration:.1f}s segment (starting at {start_sec:.1f}s) into {num_workers} chunks of {chunk_duration:.1f}s...")
+        
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        
+        tasks = []
+        for i in range(num_workers):
+            chunk_start_sec = start_sec + i * chunk_duration
+            dur = chunk_duration if i < num_workers - 1 else slice_duration - (i * chunk_duration)
+            out_json = str(out_path / f"detections_chunk_{i}.json")
+            
+            tasks.append((
+                checkpoint, video, out_json, chunk_start_sec, dur, img_size,
+                score_thresh, iou_thresh, num_queries, companion_mode,
+                batch_frames, tile_batch_size, infer_every, detect_height
+            ))
+            
+        ctx = multiprocessing.get_context("spawn")
+        processes = []
+        for task in tasks:
+            p = ctx.Process(target=_detect_worker, args=(task,))
+            p.start()
+            processes.append(p)
+            
+        print(f"Started {num_workers} detection workers.")
+        for p in processes:
+            p.join()
+            
+        print(f"Parallel detection complete. Outputs written to {output_dir}")
 
-    if frame_block:   # flush remainder
-        _write_block()
 
-    pbar.close()
-    cap.release()
-    writer.release()
+def _detect_worker(args):
+    """
+    Pickleable worker function for detect_parallel.
+    """
+    (
+        checkpoint, video, output_json, start_sec, duration_sec, img_size,
+        score_thresh, iou_thresh, num_queries, companion_mode,
+        batch_frames, tile_batch_size, infer_every, detect_height
+    ) = args
 
-    mean_count  = sum(count_history) / max(len(count_history), 1)
-    mean_escape = mean_count * (3600 / traverse_seconds)
-    print(f'\nDone. Frames: {n_to_process}  batch_frames: {batch_frames}  '
-          f'Mean count: {mean_count:.1f}  '
-          f'Mean hourly escapement: {mean_escape:,.0f} fish/hr  |  {output}')
+    pipeline = Pipeline()
+    pipeline.detect(
+        checkpoint=checkpoint, video=video, output_json=output_json,
+        start_sec=start_sec, duration_sec=duration_sec, img_size=img_size,
+        score_thresh=score_thresh, iou_thresh=iou_thresh, num_queries=num_queries,
+        companion_mode=companion_mode, batch_frames=batch_frames,
+        tile_batch_size=tile_batch_size, infer_every=infer_every,
+        detect_height=detect_height
+    )
 
 
 if __name__ == '__main__':
-    fire.Fire(main)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].startswith('--'):
+        sys.argv.insert(1, 'run_all')
+    fire.Fire(Pipeline)
