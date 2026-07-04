@@ -131,8 +131,7 @@ class STrack:
             self.mean = mean
             self.covariance = covariance
             self.age += 1
-            if self.state == 1:
-                self.time_since_update += 1
+            self.time_since_update += 1
             self.tlbr = self.xyah_to_tlbr(self.mean[:4])
 
     def activate(self, kf: KalmanFilter, frame_id: int, track_id: int):
@@ -145,6 +144,8 @@ class STrack:
         cx = (self.tlbr[0] + self.tlbr[2]) / 2.0
         cy = (self.tlbr[1] + self.tlbr[3]) / 2.0
         self.history.append((cx, cy, frame_id))
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
         
     def update(self, kf: KalmanFilter, frame_id: int, new_track: STrack):
         self.tlbr = new_track.tlbr
@@ -156,6 +157,8 @@ class STrack:
         cx = (self.tlbr[0] + self.tlbr[2]) / 2.0
         cy = (self.tlbr[1] + self.tlbr[3]) / 2.0
         self.history.append((cx, cy, frame_id))
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
         
     def mark_lost(self):
         self.state = 2
@@ -328,11 +331,14 @@ def get_motion_vector(track: STrack, current_frame_idx: int, fps: float) -> tupl
     target_frame = current_frame_idx - fps
     best_item = None
     best_diff = float('inf')
-    for cx, cy, f_id in track.history:
+    for cx, cy, f_id in reversed(track.history):
         diff = abs(f_id - target_frame)
         if diff < best_diff:
             best_diff = diff
             best_item = (cx, cy, f_id)
+        else:
+            # Since f_id is sorted, once diff starts increasing, we've passed the minimum
+            break
     if best_item is None:
         return None
     cx_prev, cy_prev, f_id_prev = best_item
