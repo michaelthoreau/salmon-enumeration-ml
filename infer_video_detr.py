@@ -616,7 +616,9 @@ class Pipeline:
             output_json_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_json_path, 'w') as f:
                 json.dump(out_data, f)
-            print(f"Saved detections to {output_json}")
+            msg = f"Saved detections to {output_json}"
+            print(msg)
+            return msg
 
         return out_data
 
@@ -750,7 +752,9 @@ class Pipeline:
             output_track_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_track_path, 'w') as f:
                 json.dump(out_data, f)
-            print(f"Saved tracks to {output_track_json}")
+            msg = f"Saved tracks to {output_track_json}"
+            print(msg)
+            return msg
 
         return out_data
 
@@ -765,7 +769,8 @@ class Pipeline:
         graph_width: int = 700,
         dot_radius: int = 6,
         traverse_seconds: float = 25.0,
-        ma_window: int = 30
+        ma_window: int = 30,
+        render_height: int | None = 1080
     ) -> str:
         """
         Stage 3: CPU/UI-bound rendering. Takes tracking JSON/dict and original video, 
@@ -791,60 +796,105 @@ class Pipeline:
         w_vid        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h_vid        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
+        # ---- calculate target rendering size ----
+        if render_height is not None and h_vid != render_height:
+            scale = render_height / h_vid
+            w_out = int(w_vid * scale)
+            h_out = render_height
+        else:
+            scale = 1.0
+            w_out = w_vid
+            h_out = h_vid
+
+        tracks_dict = track_data.get("tracks", {})
+        
+        # Determine sorted keys within start and end frame bounds
+        sorted_keys = sorted(int(k) for k in tracks_dict.keys())
         start_frame = int(start_sec * fps)
         if duration_sec is not None:
             n_to_process = int(duration_sec * fps)
             end_frame = min(start_frame + n_to_process, total_frames)
         else:
             end_frame = total_frames
-            n_to_process = end_frame - start_frame
+        
+        sorted_keys = [k for k in sorted_keys if start_frame <= k < end_frame]
+        
+        # Calculate dynamic infer_every
+        if len(sorted_keys) >= 2:
+            diffs = [sorted_keys[i] - sorted_keys[i-1] for i in range(1, len(sorted_keys))]
+            from collections import Counter
+            infer_every = Counter(diffs).most_common(1)[0][0]
+        else:
+            infer_every = 1
 
-        print(f'Rendering video: {output_video}  ({n_to_process} frames)...')
+        fps_out = fps / infer_every
+        print(f'Rendering video: {output_video}  ({len(sorted_keys)} frames at {w_out}x{h_out}, {fps_out:.2f} fps)...')
 
         fourcc     = cv2.VideoWriter_fourcc(*'mp4v')
-        writer     = cv2.VideoWriter(output_video, fourcc, fps, (w_vid, h_vid))
+        writer     = cv2.VideoWriter(output_video, fourcc, fps_out, (w_out, h_out))
 
         count_history = deque(maxlen=max(ma_window * 3, 90))
-        
-        tracks_dict = track_data.get("tracks", {})
         metrics = track_data.get("metrics", {})
         frame_counts = metrics.get("frame_counts", {})
         frame_speeds = metrics.get("frame_speeds", {})
         frame_directions = metrics.get("frame_directions", {})
 
-        last_centroids = []
-        last_mean_speed = 0.0
-        last_mean_vector = None
-        last_count = 0
-
-        pbar = tqdm(total=n_to_process, desc='Rendering', unit='frame', ncols=100)
+        pbar = tqdm(total=len(sorted_keys), desc='Rendering', unit='frame', ncols=100)
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        current_pos = start_frame
         
-        for frame_idx in range(start_frame, end_frame):
+        for frame_idx in sorted_keys:
+            # Skip in-between frames efficiently without decoding
+            while current_pos < frame_idx:
+                cap.grab()
+                current_pos += 1
+                
             ok, frame_bgr = cap.read()
+            current_pos += 1
             if not ok:
                 break
 
+            if scale != 1.0:
+                frame_bgr = cv2.resize(frame_bgr, (w_out, h_out))
+
             f_key = str(frame_idx)
-            if f_key in tracks_dict:
-                last_centroids = tracks_dict[f_key]
-                last_mean_speed = frame_speeds.get(f_key, 0.0)
-                raw_dir = frame_directions.get(f_key, None)
-                last_mean_vector = np.array(raw_dir) if raw_dir is not None else None
+            last_centroids = tracks_dict[f_key]
+            last_mean_speed = frame_speeds.get(f_key, 0.0)
+            raw_dir = frame_directions.get(f_key, None)
+            last_mean_vector = np.array(raw_dir) if raw_dir is not None else None
+            
+            last_count = frame_counts.get(f_key, 0)
+            count_history.append(last_count)
+
+            # Apply scale to centroids
+            scaled_centroids = []
+            for item in last_centroids:
+                if isinstance(item, dict):
+                    x = item["cx"]
+                    y = item["cy"]
+                    track_id = item["track_id"]
+                    prev_pos = item.get("prev_pos", None)
+                else:
+                    x, y, track_id, prev_pos = item
                 
-                last_count = frame_counts.get(f_key, 0)
-                count_history.append(last_count)
+                sx = int(x * scale)
+                sy = int(y * scale)
+                sprev = (int(prev_pos[0] * scale), int(prev_pos[1] * scale)) if prev_pos is not None else None
+                scaled_centroids.append((sx, sy, track_id, sprev))
+
+            mean_speed_val = last_mean_speed * scale
+            mean_vector_val = last_mean_vector * scale if last_mean_vector is not None else None
 
             ma_val    = sum(count_history) / max(len(count_history), 1)
-            out_frame = _draw_centroids(frame_bgr, last_centroids, radius=dot_radius)
+            out_frame = _draw_centroids(frame_bgr, scaled_centroids, radius=dot_radius)
             out_frame = _draw_count_graph(
                 out_frame, count_history, ma_window,
                 hourly_rate=ma_val * (3600 / traverse_seconds),
                 traverse_seconds=traverse_seconds,
                 graph_h=graph_height, graph_w=graph_width,
             )
-            out_frame = _draw_motion_panel(out_frame, last_mean_speed, len(last_centroids), last_mean_vector)
+            out_frame = _draw_motion_panel(out_frame, mean_speed_val, len(scaled_centroids), mean_vector_val)
             writer.write(out_frame)
             pbar.update(1)
 
@@ -877,7 +927,8 @@ class Pipeline:
         traverse_seconds: float = 25.0,
         track_thresh: float = 0.35,
         min_box_score: float = 0.1,
-        detect_height: int | None = None
+        detect_height: int | None = None,
+        render_height: int | None = 1080
     ):
         """
         Run the entire pipeline (Detect -> Track -> Render) sequentially in memory.
@@ -905,7 +956,7 @@ class Pipeline:
             start_sec=start_sec, duration_sec=duration_sec,
             graph_height=graph_height, graph_width=graph_width,
             dot_radius=dot_radius, traverse_seconds=traverse_seconds,
-            ma_window=ma_window
+            ma_window=ma_window, render_height=render_height
         )
 
     def detect_parallel(
