@@ -34,7 +34,7 @@ cache_volume = modal.Volume.from_name("salmon-cache-volume", create_if_missing=T
 
 @app.function(
     image=image,
-    gpu="T4", # Default GPU, can be overridden with local_entrypoint main CLI argument
+    gpu="L40S", # Default GPU, can be overridden with local_entrypoint main CLI argument
     volumes={
         "/root/salmon-ml/runs": runs_volume,
         "/root/salmon-ml/frame_cache": cache_volume,
@@ -92,11 +92,12 @@ def main(
     decay_steps: int = 5000,
     batch_size: int = 8,
     name: str = None,
+    temporal_fusion: str = "early",
 ):
     if name:
         run_name = f"runs/{name}"
     else:
-        run_name = f"runs/exp_cf{num_context_frames}_cs{context_stride}_lr{lr}"
+        run_name = f"runs/exp_cf{num_context_frames}_cs{context_stride}_lr{lr}_{temporal_fusion}"
         
     kwargs = {
         "num_context_frames": num_context_frames,
@@ -106,6 +107,7 @@ def main(
         "decay_steps": decay_steps,
         "batch_size": batch_size,
         "save_path": run_name,
+        "temporal_fusion": temporal_fusion,
     }
     
     print(f"Launching remote training on Modal (saving logs to {run_name})...")

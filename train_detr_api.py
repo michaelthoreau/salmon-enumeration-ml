@@ -43,6 +43,149 @@ def _load_dotenv():
 
 _load_dotenv()
 
+from transformers.models.detr.modeling_detr import DetrModelOutput
+
+class DetrModelWithTemporalFusion(nn.Module):
+    def __init__(self, original_model, num_context_frames):
+        super().__init__()
+        self.config = original_model.config
+        self.backbone = original_model.backbone
+        self.input_projection = original_model.input_projection
+        self.position_embedding = original_model.position_embedding
+        self.encoder = original_model.encoder
+        self.decoder = original_model.decoder
+        self.query_position_embeddings = original_model.query_position_embeddings
+        self.num_context_frames = num_context_frames
+        
+        # Learnable temporal embeddings: shape [1 + N, 1, 256]
+        self.temporal_embeddings = nn.Parameter(
+            torch.zeros(1 + num_context_frames, 1, self.config.d_model)
+        )
+        nn.init.normal_(self.temporal_embeddings, std=0.02)
+        
+    def forward(
+        self,
+        pixel_values=None,
+        pixel_mask=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
+        inputs_embeds=None,
+        decoder_inputs_embeds=None,
+        **kwargs
+    ):
+        if inputs_embeds is not None or self.num_context_frames == 0:
+            if inputs_embeds is None:
+                batch_size, num_channels, height, width = pixel_values.shape
+                device = pixel_values.device
+                if pixel_mask is None:
+                    pixel_mask = torch.ones(((batch_size, height, width)), device=device)
+                vision_features = self.backbone(pixel_values, pixel_mask)
+                feature_map, mask = vision_features[-1]
+                projected_feature_map = self.input_projection(feature_map)
+                flattened_features = projected_feature_map.flatten(2).transpose(1, 2)
+                spatial_position_embeddings = (
+                    self.position_embedding(shape=feature_map.shape, device=device, dtype=pixel_values.dtype, mask=mask)
+                    .flatten(2)
+                    .transpose(1, 2)
+                )
+                flattened_mask = mask.flatten(1)
+            else:
+                batch_size = inputs_embeds.shape[0]
+                device = inputs_embeds.device
+                flattened_features = inputs_embeds
+                seq_len = inputs_embeds.shape[1]
+                feat_dim = int(seq_len**0.5)
+                spatial_position_embeddings = (
+                    self.position_embedding(
+                        shape=torch.Size([batch_size, self.config.d_model, feat_dim, feat_dim]),
+                        device=device,
+                        dtype=inputs_embeds.dtype,
+                    )
+                    .flatten(2)
+                    .transpose(1, 2)
+                )
+                if pixel_mask is not None:
+                    mask = nn.functional.interpolate(pixel_mask[None].float(), size=(feat_dim, feat_dim)).to(torch.bool)[0]
+                    flattened_mask = mask.flatten(1)
+                else:
+                    flattened_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
+        else:
+            batch_size, num_channels, height, width = pixel_values.shape
+            device = pixel_values.device
+            
+            groups = 1 + self.num_context_frames
+            chunks = torch.chunk(pixel_values, groups, dim=1)
+            
+            pixel_values_batched = torch.cat(chunks, dim=0)
+            
+            if pixel_mask is None:
+                pixel_mask = torch.ones(((batch_size, height, width)), device=device)
+            pixel_mask_batched = pixel_mask.repeat(groups, 1, 1)
+            
+            vision_features = self.backbone(pixel_values_batched, pixel_mask_batched)
+            feature_map, mask = vision_features[-1]
+            
+            projected_feature_map = self.input_projection(feature_map)
+            flattened_features_all = projected_feature_map.flatten(2).transpose(1, 2)
+            
+            feat_splits = torch.chunk(flattened_features_all, groups, dim=0)
+            
+            feat_with_time = []
+            for i, split in enumerate(feat_splits):
+                feat_with_time.append(split + self.temporal_embeddings[i])
+                
+            flattened_features = torch.cat(feat_with_time, dim=1)
+            
+            spatial_pos_all = (
+                self.position_embedding(shape=feature_map.shape, device=device, dtype=pixel_values.dtype, mask=mask)
+                .flatten(2)
+                .transpose(1, 2)
+            )
+            pos_splits = torch.chunk(spatial_pos_all, groups, dim=0)
+            spatial_position_embeddings = torch.cat(pos_splits, dim=1)
+            
+            mask_flat_all = mask.flatten(1)
+            mask_splits = torch.chunk(mask_flat_all, groups, dim=0)
+            flattened_mask = torch.cat(mask_splits, dim=1)
+            
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                inputs_embeds=flattened_features,
+                attention_mask=flattened_mask,
+                spatial_position_embeddings=spatial_position_embeddings,
+                **kwargs,
+            )
+
+        object_queries_position_embeddings = self.query_position_embeddings.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1
+        )
+
+        if decoder_inputs_embeds is not None:
+            queries = decoder_inputs_embeds
+        else:
+            queries = torch.zeros_like(object_queries_position_embeddings)
+
+        decoder_outputs = self.decoder(
+            inputs_embeds=queries,
+            attention_mask=decoder_attention_mask,
+            spatial_position_embeddings=spatial_position_embeddings,
+            object_queries_position_embeddings=object_queries_position_embeddings,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=flattened_mask,
+            **kwargs,
+        )
+
+        return DetrModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+            intermediate_hidden_states=decoder_outputs.intermediate_hidden_states,
+        )
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 NUM_CLASSES   = 1   # fish (background is implicit class inside DETR)
@@ -330,7 +473,7 @@ def main(
     api_key:      str   = None,
     save_path:    str   = None,
     epochs:       int   = None,
-    batch_size:   int   = 16,
+    batch_size:   int   = 2,
     lr:           float = 1e-4,
     lr_backbone:  float = 1e-5,
     lr_step:      int   = 240,
@@ -338,7 +481,7 @@ def main(
     decay_steps:  int   = 10000,
     val_every:    int   = 5,
     resume:       str   = None,
-    workers:      int   = 4,
+    workers:      int   = 8,
     cache_dir:    str   = "frame_cache",
     img_size:     int   = 512,
     box_size:     int   = 50,
@@ -349,6 +492,7 @@ def main(
     num_context_frames: int = 1,
     context_stride: int = 5,
     pretrained:   bool  = True,
+    temporal_fusion: str = "early",
 ):
     """Train DETR on salmon crop tasks pulled from Sockeye API.
 
@@ -399,6 +543,7 @@ def main(
     writer = SummaryWriter(save_path)
     writer.add_text("config/num_context_frames", str(num_context_frames))
     writer.add_text("config/context_stride", str(context_stride))
+    writer.add_text("config/temporal_fusion", str(temporal_fusion))
     print(f'Save dir  : {save_path}', flush=True)
     print(f'API Url   : {api_url}', flush=True)
     print(f'Epochs    : {epochs}  |  Batch: {batch_size}  |  LR: {lr}  |  Box: {box_size}px', flush=True)
@@ -481,10 +626,16 @@ def main(
         del pretrained_model
         print(f'  Transferred {len(transfer_state)} tensors.', flush=True)
 
-    model = model.cuda()
-
     if num_context_frames > 0:
-        _expand_first_conv_6ch(model, in_channels=3 * (1 + num_context_frames))
+        if temporal_fusion == "early":
+            _expand_first_conv_6ch(model, in_channels=3 * (1 + num_context_frames))
+            model = model.cuda()
+        elif temporal_fusion == "transformer":
+            model.model = DetrModelWithTemporalFusion(model.model, num_context_frames)
+            model = model.cuda()
+            print(f'  Swapped inner DetrModel with DetrModelWithTemporalFusion.', flush=True)
+    else:
+        model = model.cuda()
         
     n_params = sum(p.numel() for p in model.parameters())
     print(f'Parameters: {n_params / 1e6:.1f}M  |  GPU: {torch.cuda.get_device_name()}', flush=True)
@@ -564,14 +715,18 @@ def main(
             writer.add_scalar('train/lr',           optimizer.param_groups[0]['lr'], global_step)
             writer.add_scalar('train/lr_backbone',  optimizer.param_groups[1]['lr'], global_step)
 
+            gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
             pbar.set_postfix(
                 loss=f'{loss.item():.4f}',
                 ce=f'{loss_dict.get("loss_ce", 0):.3f}',
                 bb=f'{loss_dict.get("loss_bbox", 0):.3f}',
+                gpu=f'{gpu_mem:.1f}GB',
             )
         elapsed = time.time() - t0
         n = max(len(train_loader), 1)
-        print(f'Epoch {epoch:4d}  ce={running.get("loss_ce",0)/n:.4f}  bbox={running.get("loss_bbox",0)/n:.4f}  lr={optimizer.param_groups[0]["lr"]:.2e}  time={elapsed:.0f}s', flush=True)
+        peak_gpu = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f'Epoch {epoch:4d}  ce={running.get("loss_ce",0)/n:.4f}  bbox={running.get("loss_bbox",0)/n:.4f}  lr={optimizer.param_groups[0]["lr"]:.2e}  gpu_peak={peak_gpu:.1f}GB  time={elapsed:.0f}s', flush=True)
+        torch.cuda.reset_peak_memory_stats()
 
     @torch.no_grad()
     def validate(epoch):
@@ -687,23 +842,28 @@ def main(
             # Save debug crop to TensorBoard (using first image)
             if not debug_saved:
                 debug_saved = True
-                # Format GT boxes for the crop tile
-                gt_boxes_norm = []
-                W_c, H_c = crop_pil.size
-                for px, py in points:
-                    px_rel = px - x1
-                    py_rel = py - y1
-                    # normalize
-                    gt_boxes_norm.append([
-                        px_rel / W_c,
-                        py_rel / H_c,
-                        box_size / W_c,
-                        box_size / H_c
-                    ])
                 
-                # Format predictions for the crop tile
-                pred_boxes_norm = []
-                pred_scores = []
+                # Resize the crop to height 1080 (maintaining aspect ratio)
+                target_height = 1080
+                W_c, H_c = crop_pil.size
+                scale = target_height / H_c
+                target_width = int(W_c * scale)
+                
+                draw_crop = crop_pil.resize((target_width, target_height), Image.BILINEAR)
+                draw = ImageDraw.Draw(draw_crop)
+                
+                # Draw GT bounding boxes in red
+                for px, py in points:
+                    px_rel = (px - x1) * scale
+                    py_rel = (py - y1) * scale
+                    scaled_box_size = box_size * scale
+                    bx1 = px_rel - scaled_box_size / 2
+                    by1 = py_rel - scaled_box_size / 2
+                    bx2 = px_rel + scaled_box_size / 2
+                    by2 = py_rel + scaled_box_size / 2
+                    draw.rectangle([bx1, by1, bx2, by2], outline="red", width=2)
+                
+                # Draw predicted bounding boxes in green (above score threshold)
                 if all_boxes_xyxy:
                     boxes_cat = torch.cat(all_boxes_xyxy, 0)
                     scores_cat = torch.cat(all_scores, 0)
@@ -711,51 +871,11 @@ def main(
                     for idx in kept:
                         box = boxes_cat[idx]
                         score = scores_cat[idx]
-                        x1_b, y1_b, x2_b, y2_b = box.numpy()
-                        cx = (x1_b + x2_b) / 2 / W_c
-                        cy = (y1_b + y2_b) / 2 / H_c
-                        w = (x2_b - x1_b) / W_c
-                        h = (y2_b - y1_b) / H_c
-                        pred_boxes_norm.append([cx, cy, w, h])
-                        pred_scores.append(score.item())
-                        
-                frames_to_concat = []
-                for c_crop in companion_crops:
-                    if c_crop is not None:
-                        c_resized = c_crop.resize((img_size, img_size), Image.BILINEAR)
-                    else:
-                        c_resized = Image.new("RGB", (img_size, img_size), color="black")
-                    frames_to_concat.append(c_resized)
-                
-                crop_pil_resized = crop_pil.resize((img_size, img_size), Image.BILINEAR)
-                draw = ImageDraw.Draw(crop_pil_resized)
-                W_r, H_r = crop_pil_resized.size
-                
-                for box in gt_boxes_norm:
-                    cx_n, cy_n, w_n, h_n = box
-                    cx, cy = cx_n * W_r, cy_n * H_r
-                    w, h = w_n * W_r, h_n * H_r
-                    bx1, by1 = cx - w/2, cy - h/2
-                    bx2, by2 = cx + w/2, cy + h/2
-                    draw.rectangle([bx1, by1, bx2, by2], outline="red", width=2)
-                    
-                for box, score in zip(pred_boxes_norm, pred_scores):
-                    if score > score_thresh:
-                        cx_n, cy_n, w_n, h_n = box
-                        cx, cy = cx_n * W_r, cy_n * H_r
-                        w, h = w_n * W_r, h_n * H_r
-                        bx1, by1 = cx - w/2, cy - h/2
-                        bx2, by2 = cx + w/2, cy + h/2
-                        draw.rectangle([bx1, by1, bx2, by2], outline="green", width=2)
-                        
-                frames_to_concat.append(crop_pil_resized)
-                
-                total_w = img_size * len(frames_to_concat)
-                grid_im = Image.new("RGB", (total_w, img_size))
-                for idx, frame in enumerate(frames_to_concat):
-                    grid_im.paste(frame, (idx * img_size, 0))
-                    
-                img_arr = np.array(grid_im)
+                        if score.item() > score_thresh:
+                            bx1, by1, bx2, by2 = box.numpy()
+                            draw.rectangle([bx1 * scale, by1 * scale, bx2 * scale, by2 * scale], outline="green", width=2)
+                            
+                img_arr = np.array(draw_crop)
                 writer.add_image("val/predictions", img_arr, epoch, dataformats="HWC")
 
         # Compute validation loss on crops
