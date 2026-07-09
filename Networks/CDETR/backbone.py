@@ -179,6 +179,8 @@ def expand_first_conv(joiner, in_channels: int = 6):
 
     body['conv1'] = new_conv
     print(f'  Backbone first conv expanded: 3 → {in_channels} input channels.', flush=True)
+    backbone = joiner[0]
+    position_embedding = joiner[1]
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model
