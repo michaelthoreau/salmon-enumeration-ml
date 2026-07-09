@@ -218,6 +218,7 @@ def _infer_batch(
     score_thresh: float,
     iou_thresh: float,
     tile_batch_size: int = 16,
+    box_size: int = 50,
 ) -> list[list[tuple[int, int, float, float, float, float, float]]]:
     """
     Infer on multiple frames.  Tiles are collected across all frames and sent
@@ -255,7 +256,9 @@ def _infer_batch(
             if keep.any():
                 b  = bxs[keep]; s = probs[keep]
                 cx = tx + b[:, 0] * S; cy = ty + b[:, 1] * S
-                w  = b[:, 2] * S;      h  = b[:, 3] * S
+                # Override predicted width and height with fixed box_size
+                w  = torch.full_like(cx, box_size)
+                h  = torch.full_like(cy, box_size)
                 frame_boxes[fi].append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
                 frame_scores[fi].append(s)
 
@@ -464,7 +467,8 @@ class Pipeline:
         batch_frames: int = 1,
         tile_batch_size: int = 16,
         infer_every: int = 1,
-        detect_height: int | None = None
+        detect_height: int | None = None,
+        box_size: int = 50
     ) -> dict:
         """
         Stage 1: GPU-bound inference. Processes video from start_sec to start_sec+duration_sec,
@@ -546,7 +550,8 @@ class Pipeline:
 
             batch_results = (_infer_batch(model, frames_to_infer,
                                           img_size, score_thresh, iou_thresh,
-                                          tile_batch_size=tile_batch_size)
+                                          tile_batch_size=tile_batch_size,
+                                          box_size=box_size)
                               if infer_in_block else [])
             infer_by_pos = {pos: res for (_, _, pos), res in zip(infer_in_block, batch_results)}
 
