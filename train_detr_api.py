@@ -337,6 +337,7 @@ def main(
     verbose:      bool  = False,
     mlflow_tracking_uri: str = None,   # e.g. 'file:./mlruns' or a remote server URI; default local ./mlruns
     mlflow_experiment: str = 'salmon-enumeration',
+    mlflow:       str   = None,        # override MLflow run name (skips auto-resume for that name)
 ):
     """Train DETR on salmon crop tasks pulled from Sockeye API.
 
@@ -379,7 +380,7 @@ def main(
         )
 
     base = os.path.dirname(os.path.abspath(__file__))
-    auto_name = _auto_run_name(num_context_frames, context_stride, temporal_fusion)
+    auto_name = mlflow if mlflow else _auto_run_name(num_context_frames, context_stride, temporal_fusion)
 
     # Initialize MLflow client early to resolve save_path/resume/auto-resume
     mlflow_enabled = False
@@ -445,10 +446,13 @@ def main(
         return candidates[0][0]
 
     resume_run_id = None
+    # When the user explicitly provides a run name via --mlflow, skip auto-resume
+    # so that a fresh run is always started under that name.
+    explicit_run_name = bool(mlflow)
 
     if save_path:
         run_name_candidate = os.path.basename(save_path.rstrip('/'))
-        if not resume:
+        if not resume and not explicit_run_name:
             existing_run = find_mlflow_run_by_name(run_name_candidate)
             if existing_run:
                 resume = run_name_candidate
@@ -476,15 +480,19 @@ def main(
                 pass
             save_path = os.path.join(base, 'runs', auto_name)
         else:
-            existing_run = find_mlflow_run_by_name(auto_name)
-            if existing_run:
-                resume = auto_name
-                resume_run_id = existing_run.info.run_id
-                save_path = os.path.join(base, 'runs', auto_name)
-                print(f"Auto-resuming from default MLflow run: {auto_name} (ID: {resume_run_id})", flush=True)
+            if not explicit_run_name:
+                existing_run = find_mlflow_run_by_name(auto_name)
+                if existing_run:
+                    resume = auto_name
+                    resume_run_id = existing_run.info.run_id
+                    save_path = os.path.join(base, 'runs', auto_name)
+                    print(f"Auto-resuming from default MLflow run: {auto_name} (ID: {resume_run_id})", flush=True)
+                else:
+                    save_path = os.path.join(base, 'runs', auto_name)
+                    print(f"Starting new default MLflow run: {auto_name}", flush=True)
             else:
                 save_path = os.path.join(base, 'runs', auto_name)
-                print(f"Starting new default MLflow run: {auto_name}", flush=True)
+                print(f"Starting new MLflow run (explicit name): {auto_name}", flush=True)
 
     os.makedirs(save_path, exist_ok=True)
 
