@@ -638,9 +638,17 @@ def main(
     ]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
 
-    total_steps = warmup_steps + decay_steps
+    steps_per_epoch = max(len(train_loader), 1)
     if epochs is None:
-        epochs = math.ceil(total_steps / max(len(train_loader), 1))
+        # Derive epochs from the step budget
+        total_steps = warmup_steps + decay_steps
+        epochs = math.ceil(total_steps / steps_per_epoch)
+    else:
+        # Epochs explicitly requested — step budget must cover the full run.
+        # Keep warmup as-is; stretch decay to fill the remaining steps.
+        epoch_steps = epochs * steps_per_epoch
+        total_steps = max(warmup_steps + decay_steps, epoch_steps)
+        decay_steps  = total_steps - warmup_steps
 
     if mlflow_enabled:
         try:
