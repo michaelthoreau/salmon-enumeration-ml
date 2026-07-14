@@ -273,3 +273,57 @@ async function fetchSalmonDetections(taskData) {
 }
 ```
 
+---
+
+## Evaluation Results
+
+### Model Comparison
+Below is a comparison of performance on the validation task set (105 tasks) between the best context model and the best model without context:
+
+| Model Config | Run ID | Count MAE | Count RMSE | Max Abs Error | AP @ 0.10 | AP @ 0.25 | AP @ 0.50 | AP @ 0.75 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **With Context** (N=2, Stride=20) | `2a4ca563` | 13.2667 | 17.6141 | 63 | 0.7474 | 0.6216 | 0.2412 | 0.0443 |
+| **Without Context** (N=0) | `00412b53` | 8.3143 | 12.2081 | 50 | 0.7576 | 0.6102 | 0.1909 | 0.0116 |
+
+---
+
+### DETR with Context (Best Model)
+- **Model Directory:** `models/best_with_context/`
+- **Run ID:** `2a4ca563725447bf92a921a35f678f76`
+- **Context Config:** `num_context_frames: 2`, `context_stride: 20`
+
+#### Count Metrics (Score Threshold = 0.25)
+- **Mean Absolute Error (MAE):** 13.2667
+- **Root Mean Squared Error (RMSE):** 17.6141
+- **Max Absolute Error:** 63
+
+#### Detection Metrics (NMS Centroid Distance = 40.0px)
+| IoU Thresh | Precision | Recall | F1-Score | AP | TP | FP | FN |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0.10** | 0.5547 | 0.8211 | 0.6621 | 0.7474 | 2286 | 1835 | 498 |
+| **0.25** | 0.5050 | 0.7475 | 0.6028 | 0.6216 | 2081 | 2040 | 703 |
+| **0.50** | 0.3142 | 0.4652 | 0.3751 | 0.2412 | 1295 | 2826 | 1489 |
+| **0.75** | 0.1284 | 0.1900 | 0.1532 | 0.0443 | 529 | 3592 | 2255 |
+
+---
+
+### DETR without Context (Best Model)
+- **Model Directory:** `models/best_without_context/`
+- **Run ID:** `00412b537a4942619cf7b8086f3720f8`
+- **Context Config:** `num_context_frames: 0`, `context_stride: 0`
+
+#### Count Metrics (Score Threshold = 0.25)
+- **Mean Absolute Error (MAE):** 8.3143
+- **Root Mean Squared Error (RMSE):** 12.2081
+- **Max Absolute Error:** 50
+
+#### Detection Metrics (NMS Centroid Distance = 40.0px)
+| IoU Thresh | Precision | Recall | F1-Score | AP | TP | FP | FN |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0.10** | 0.6682 | 0.7812 | 0.7203 | 0.7576 | 2175 | 1080 | 609 |
+| **0.25** | 0.5948 | 0.6954 | 0.6412 | 0.6102 | 1936 | 1319 | 848 |
+| **0.50** | 0.3250 | 0.3800 | 0.3504 | 0.1909 | 1058 | 2197 | 1726 |
+| **0.75** | 0.0768 | 0.0898 | 0.0828 | 0.0116 | 250 | 3005 | 2534 |
+
+
+
