@@ -1,7 +1,0 @@
-{
-  "name": "salmon-enumeration-ml",
-  "private": true,
-  "scripts": {
-    "dev": "pnpm --dir app dev"
-  }
-}
