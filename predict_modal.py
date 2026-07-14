@@ -34,7 +34,6 @@ image = (
         "opencv-python-headless",
         "fastapi",
         "av",
-        "boto3"
     )
     .add_local_dir(
         ".",
@@ -470,7 +469,7 @@ def _pixel_to_latlon(col: float, row: float, z: int, x_min: int, y_min: int, til
     gpu="T4",
     scaledown_window=300,
     enable_memory_snapshot=True,
-    secrets=[modal.Secret.from_dotenv(), modal.Secret.from_name("salmon-s3")],
+    secrets=[modal.Secret.from_dotenv()],
     timeout=600,
 )
 class SalmonInferenceServer:
@@ -776,36 +775,32 @@ class SalmonInferenceServer:
 
         @web_app.post("/predict_ortho")
         def predict_ortho(data: dict):
-            import boto3
-            import json
+            import requests as http_requests
 
-            tiles_key = data.get("tiles_key")
             bounds = data.get("bounds")  # [minlng, minlat, maxlng, maxlat]
             zoom = int(data.get("zoom", 20))
             score_thresh = float(data.get("score_thresh", 0.25))
             iou_thresh = float(data.get("iou_thresh", 0.5))
             checkpoint_req = data.get("checkpoint_path")
 
-            if not tiles_key or not bounds or len(bounds) != 4:
-                raise HTTPException(status_code=400, detail="Missing tiles_key or bounds [minlng,minlat,maxlng,maxlat]")
+            # Tile server params (preferred path — tiles served dynamically)
+            tile_server_url = data.get("tile_server_url")
+            tile_server_token = data.get("tile_server_token")
+            ortho_key = data.get("ortho_key")
+            bucket = data.get("bucket", "")
+
+            if not bounds or len(bounds) != 4:
+                raise HTTPException(status_code=400, detail="Missing bounds [minlng,minlat,maxlng,maxlat]")
+            if not tile_server_url or not tile_server_token or not ortho_key:
+                raise HTTPException(status_code=400, detail="Missing tile_server_url, tile_server_token, or ortho_key")
 
             checkpoint_path = resolve_checkpoint(checkpoint_req)
             model, model_type, num_context_frames, _ = self.get_model(checkpoint_path)
 
-            # Resolve S3 credentials from environment (injected via salmon-s3 secret)
-            bucket = os.environ.get("S3_BUCKET_NAME")
-            if not bucket:
-                raise HTTPException(status_code=500, detail="S3_BUCKET_NAME not configured")
-            s3 = boto3.client(
-                "s3",
-                region_name=os.environ.get("AWS_REGION", "us-east-1"),
-                aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            )
-
             minlng, minlat, maxlng, maxlat = bounds
 
             # Find tile range at chosen zoom, capping tile count to avoid OOM
+            tile_count = 9999
             for z in range(zoom, max(zoom - 4, 14) - 1, -1):
                 x_min, y_min = _latlon_to_tile(z, maxlat, minlng)  # top-left
                 x_max, y_max = _latlon_to_tile(z, minlat, maxlng)  # bottom-right
@@ -821,14 +816,24 @@ class SalmonInferenceServer:
             height = (y_max - y_min + 1) * TILE_SIZE
             stitched = Image.new("RGB", (width, height), (0, 0, 0))
 
-            # Fetch tiles in parallel
+            # Fetch tiles from the dynamic tile server in parallel
+            session = http_requests.Session()
+            session.headers.update({"Authorization": f"Bearer {tile_server_token}"})
+
             def fetch_tile(tx, ty):
-                key = f"{tiles_key.rstrip('/')}/{zoom}/{tx}/{ty}.webp"
+                url = (
+                    f"{tile_server_url.rstrip('/')}/tiles/{zoom}/{tx}/{ty}"
+                    f"?key={urllib.parse.quote(ortho_key, safe='')}"
+                    f"&bucket={urllib.parse.quote(bucket, safe='')}"
+                    f"&tilesize={TILE_SIZE}"
+                )
                 try:
-                    resp = s3.get_object(Bucket=bucket, Key=key)
-                    return tx, ty, Image.open(io.BytesIO(resp["Body"].read())).convert("RGB")
-                except Exception:
-                    return tx, ty, None
+                    resp = session.get(url, timeout=15)
+                    if resp.status_code == 200:
+                        return tx, ty, Image.open(io.BytesIO(resp.content)).convert("RGB")
+                except Exception as e:
+                    print(f"[predict_ortho] tile {zoom}/{tx}/{ty} error: {e}")
+                return tx, ty, None
 
             coords = [(tx, ty) for tx in range(x_min, x_max + 1) for ty in range(y_min, y_max + 1)]
             with ThreadPoolExecutor(max_workers=16) as ex:
