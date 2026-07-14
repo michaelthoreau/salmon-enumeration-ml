@@ -33,7 +33,8 @@ image = (
         "scipy",
         "opencv-python-headless",
         "fastapi",
-        "av"
+        "av",
+        "boto3"
     )
     .add_local_dir(
         ".",
@@ -440,6 +441,27 @@ def _make_tiles(pil_img, S: int, companion_crops, num_context_frames: int):
     return tiles
 
 # ---------------------------------------------------------------------------
+# Web Mercator tile math helpers
+# ---------------------------------------------------------------------------
+
+def _latlon_to_tile(z: int, lat: float, lng: float):
+    """Convert lat/lng to tile (x, y) at zoom z."""
+    n = 2 ** z
+    x = int((lng + 180.0) / 360.0 * n)
+    lat_r = math.radians(lat)
+    y = int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+    return x, y
+
+def _pixel_to_latlon(col: float, row: float, z: int, x_min: int, y_min: int, tile_size: int = 256):
+    """Convert pixel (col, row) in stitched image → (lng, lat)."""
+    n = 2 ** z
+    tx = x_min + col / tile_size
+    ty = y_min + row / tile_size
+    lng = tx / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n))))
+    return lng, lat
+
+# ---------------------------------------------------------------------------
 # Modal Class-based Web Server
 # ---------------------------------------------------------------------------
 
@@ -448,7 +470,7 @@ def _make_tiles(pil_img, S: int, companion_crops, num_context_frames: int):
     gpu="T4",
     scaledown_window=300,
     enable_memory_snapshot=True,
-    secrets=[modal.Secret.from_dotenv()],
+    secrets=[modal.Secret.from_dotenv(), modal.Secret.from_name("salmon-s3")],
     timeout=600,
 )
 class SalmonInferenceServer:
@@ -482,6 +504,81 @@ class SalmonInferenceServer:
             model_info = load_model_from_checkpoint(checkpoint_path, device="cuda")
             self.cached_models[checkpoint_path] = model_info
         return self.cached_models[checkpoint_path]
+
+    def _infer_image(self, pil_img, model, model_type, num_context_frames,
+                     score_thresh, iou_thresh, companion_crops=None, S=512):
+        """Tile a PIL image, run inference, apply NMS. Returns pixel-space points."""
+        tiles = _make_tiles(pil_img, S, companion_crops or [], num_context_frames)
+        all_boxes_xyxy = []
+        all_scores = []
+        box_size = 50
+
+        with torch.no_grad():
+            for tile_t, tx, ty, orig_W, orig_H in tiles:
+                pv = tile_t.unsqueeze(0).cuda()
+                pm = torch.ones(1, S, S, dtype=torch.long).cuda()
+
+                if model_type == "iocformer":
+                    out_all = model(pv)
+                    d6 = out_all[0] if isinstance(out_all, list) else out_all
+                    probs = d6['pred_logits'].sigmoid()[0, :, 1].cpu()
+                    pts = d6['pred_points'][0].cpu()
+                    keep = probs > score_thresh
+                    if keep.any():
+                        p_kept = pts[keep]; s_kept = probs[keep]
+                        if orig_W < S or orig_H < S:
+                            cx = p_kept[:, 0] * orig_W; cy = p_kept[:, 1] * orig_H
+                            w = torch.full_like(cx, box_size * (orig_W / S)); h = torch.full_like(cy, box_size * (orig_H / S))
+                        else:
+                            cx = tx + p_kept[:, 0] * S; cy = ty + p_kept[:, 1] * S
+                            w = torch.full_like(cx, box_size); h = torch.full_like(cy, box_size)
+                        all_boxes_xyxy.append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
+                        all_scores.append(s_kept)
+
+                elif model_type == "cnn":
+                    from train_cnn_api import extract_peaks
+                    out_heatmap = model(pv).cpu()[0]
+                    peaks = extract_peaks(out_heatmap.unsqueeze(0), threshold=score_thresh)[0]
+                    if peaks:
+                        pts = torch.tensor([[p[0], p[1]] for p in peaks], dtype=torch.float)
+                        s_kept = torch.tensor([p[2] for p in peaks], dtype=torch.float)
+                        if orig_W < S or orig_H < S:
+                            cx = pts[:, 0] * (orig_W / S); cy = pts[:, 1] * (orig_H / S)
+                            w = torch.full_like(cx, box_size * (orig_W / S)); h = torch.full_like(cy, box_size * (orig_H / S))
+                        else:
+                            cx = tx + pts[:, 0]; cy = ty + pts[:, 1]
+                            w = torch.full_like(cx, box_size); h = torch.full_like(cy, box_size)
+                        all_boxes_xyxy.append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
+                        all_scores.append(s_kept)
+
+                else:  # detr
+                    out = model(pixel_values=pv, pixel_mask=pm)
+                    probs = out.logits.cpu()[0].softmax(-1)[:, 0]
+                    b = out.pred_boxes.cpu()[0]
+                    keep = probs > score_thresh
+                    if keep.any():
+                        b = b[keep]; s = probs[keep]
+                        if orig_W < S or orig_H < S:
+                            cx = b[:, 0] * orig_W; cy = b[:, 1] * orig_H
+                            w = torch.full_like(cx, box_size * (orig_W / S)); h = torch.full_like(cy, box_size * (orig_H / S))
+                        else:
+                            cx = tx + b[:, 0] * S; cy = ty + b[:, 1] * S
+                            w = torch.full_like(cx, box_size); h = torch.full_like(cy, box_size)
+                        all_boxes_xyxy.append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
+                        all_scores.append(s)
+
+        points = []
+        if all_boxes_xyxy:
+            boxes_cat = torch.cat(all_boxes_xyxy, 0)
+            scores_cat = torch.cat(all_scores, 0)
+            kept = tv_nms(boxes_cat, scores_cat, iou_threshold=iou_thresh)
+            W, H = pil_img.size
+            for idx in kept.tolist():
+                bx1, by1, bx2, by2 = boxes_cat[idx].tolist()
+                cx = max(0.0, min(float(W), (bx1 + bx2) / 2.0))
+                cy = max(0.0, min(float(H), (by1 + by2) / 2.0))
+                points.append({"x": cx, "y": cy, "score": round(scores_cat[idx].item(), 4)})
+        return points
 
     @modal.asgi_app()
     def fastapi_app(self):
@@ -651,130 +748,20 @@ class SalmonInferenceServer:
                 
             W_crop, H_crop = pil_img.size
 
-            # 4. Generate tiles (always S=512 crop size)
-            S = 512
-            tiles = _make_tiles(pil_img, S, companion_crops, num_context_frames)
-            
-            all_boxes_xyxy = []
-            all_scores = []
-            box_size = 50
-            
-            # 5. Run inference on tiles
-            with torch.no_grad():
-                for tile_t, tx, ty, orig_W, orig_H in tiles:
-                    pv = tile_t.unsqueeze(0).cuda()
-                    pm = torch.ones(1, S, S, dtype=torch.long).cuda()
-                    
-                    if model_type == "iocformer":
-                        out_all = model(pv)
-                        if isinstance(out_all, list):
-                            d6 = out_all[0]
-                        else:
-                            d6 = out_all
-                        probs = d6['pred_logits'].sigmoid()[0, :, 1].cpu()
-                        pts = d6['pred_points'][0].cpu()
-                        
-                        keep = probs > score_thresh
-                        if keep.any():
-                            p_kept = pts[keep]
-                            s_kept = probs[keep]
-                            
-                            if orig_W < S or orig_H < S:
-                                cx = p_kept[:, 0] * orig_W
-                                cy = p_kept[:, 1] * orig_H
-                                w = torch.full_like(cx, box_size * (orig_W / S))
-                                h = torch.full_like(cy, box_size * (orig_H / S))
-                            else:
-                                cx = tx + p_kept[:, 0] * S
-                                cy = ty + p_kept[:, 1] * S
-                                w = torch.full_like(cx, box_size)
-                                h = torch.full_like(cy, box_size)
-                                
-                            tile_boxes = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], 1)
-                            all_boxes_xyxy.append(tile_boxes)
-                            all_scores.append(s_kept)
-                    elif model_type == "cnn":
-                        # CNN (heatmap regression)
-                        out_heatmap = model(pv).cpu()[0] # [512, 512]
-                        
-                        from train_cnn_api import extract_peaks
-                        # Extract peaks above threshold
-                        peaks = extract_peaks(out_heatmap.unsqueeze(0), threshold=score_thresh)[0]
-                        
-                        if peaks:
-                            pts = torch.tensor([[p[0], p[1]] for p in peaks], dtype=torch.float)
-                            s_kept = torch.tensor([p[2] for p in peaks], dtype=torch.float)
-                            
-                            if orig_W < S or orig_H < S:
-                                cx = pts[:, 0] * (orig_W / S)
-                                cy = pts[:, 1] * (orig_H / S)
-                                w = torch.full_like(cx, box_size * (orig_W / S))
-                                h = torch.full_like(cy, box_size * (orig_H / S))
-                            else:
-                                cx = tx + pts[:, 0]
-                                cy = ty + pts[:, 1]
-                                w = torch.full_like(cx, box_size)
-                                h = torch.full_like(cy, box_size)
-                                
-                            tile_boxes = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], 1)
-                            all_boxes_xyxy.append(tile_boxes)
-                            all_scores.append(s_kept)
-                    else:
-                        # DETR
-                        out = model(pixel_values=pv, pixel_mask=pm)
-                        logits = out.logits.cpu()[0]
-                        boxes = out.pred_boxes.cpu()[0]
-                        
-                        probs = logits.softmax(-1)[:, 0]
-                        keep = probs > score_thresh
-                        if keep.any():
-                            b = boxes[keep]
-                            s = probs[keep]
-                            
-                            if orig_W < S or orig_H < S:
-                                cx = b[:, 0] * orig_W
-                                cy = b[:, 1] * orig_H
-                                w  = torch.full_like(cx, box_size * (orig_W / S))
-                                h  = torch.full_like(cy, box_size * (orig_H / S))
-                            else:
-                                cx = tx + b[:, 0] * S
-                                cy = ty + b[:, 1] * S
-                                w  = torch.full_like(cx, box_size)
-                                h  = torch.full_like(cy, box_size)
-                                
-                            tile_boxes = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], 1)
-                            all_boxes_xyxy.append(tile_boxes)
-                            all_scores.append(s)
-
-            # 6. Apply Non-Maximum Suppression (NMS) across tiles
+            # 4-6. Tile, infer, NMS
+            raw_pts = self._infer_image(pil_img, model, model_type, num_context_frames,
+                                        score_thresh, iou_thresh, companion_crops)
             points_list = []
-            if all_boxes_xyxy:
-                boxes_cat = torch.cat(all_boxes_xyxy, 0)
-                scores_cat = torch.cat(all_scores, 0)
-                kept = tv_nms(boxes_cat, scores_cat, iou_threshold=iou_thresh)
-                
-                for idx in kept.tolist():
-                    box = boxes_cat[idx]
-                    score = scores_cat[idx].item()
-                    bx1, by1, bx2, by2 = box.tolist()
-                    cx_crop = (bx1 + bx2) / 2.0
-                    cy_crop = (by1 + by2) / 2.0
-                    
-                    # Ensure coordinates are within crop borders
-                    cx_crop = max(0.0, min(float(W_crop), cx_crop))
-                    cy_crop = max(0.0, min(float(H_crop), cy_crop))
-                    
-                    # Absolute coordinates on the full video frame
-                    cx_absolute = x1 + cx_crop
-                    cy_absolute = y1 + cy_crop
-                    
-                    points_list.append({
-                        "x": round(cx_absolute, 2),
-                        "y": round(cy_absolute, 2),
-                        "crop_x": round(cx_crop, 2),
-                        "crop_y": round(cy_crop, 2),
-                        "score": round(score, 4)
-                    })
+            for p in raw_pts:
+                cx_crop = max(0.0, min(float(W_crop), p["x"]))
+                cy_crop = max(0.0, min(float(H_crop), p["y"]))
+                points_list.append({
+                    "x": round(x1 + cx_crop, 2),
+                    "y": round(y1 + cy_crop, 2),
+                    "crop_x": round(cx_crop, 2),
+                    "crop_y": round(cy_crop, 2),
+                    "score": p["score"],
+                })
 
             return {
                 "points": points_list,
@@ -785,6 +772,94 @@ class SalmonInferenceServer:
                     "context_stride": context_stride,
                     "checkpoint_used": checkpoint_path
                 }
+            }
+
+        @web_app.post("/predict_ortho")
+        def predict_ortho(data: dict):
+            import boto3
+            import json
+
+            tiles_key = data.get("tiles_key")
+            bounds = data.get("bounds")  # [minlng, minlat, maxlng, maxlat]
+            zoom = int(data.get("zoom", 20))
+            score_thresh = float(data.get("score_thresh", 0.25))
+            iou_thresh = float(data.get("iou_thresh", 0.5))
+            checkpoint_req = data.get("checkpoint_path")
+
+            if not tiles_key or not bounds or len(bounds) != 4:
+                raise HTTPException(status_code=400, detail="Missing tiles_key or bounds [minlng,minlat,maxlng,maxlat]")
+
+            checkpoint_path = resolve_checkpoint(checkpoint_req)
+            model, model_type, num_context_frames, _ = self.get_model(checkpoint_path)
+
+            # Resolve S3 credentials from environment (injected via salmon-s3 secret)
+            bucket = os.environ.get("S3_BUCKET_NAME")
+            if not bucket:
+                raise HTTPException(status_code=500, detail="S3_BUCKET_NAME not configured")
+            s3 = boto3.client(
+                "s3",
+                region_name=os.environ.get("AWS_REGION", "us-east-1"),
+                aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            )
+
+            minlng, minlat, maxlng, maxlat = bounds
+
+            # Find tile range at chosen zoom, capping tile count to avoid OOM
+            for z in range(zoom, max(zoom - 4, 14) - 1, -1):
+                x_min, y_min = _latlon_to_tile(z, maxlat, minlng)  # top-left
+                x_max, y_max = _latlon_to_tile(z, minlat, maxlng)  # bottom-right
+                tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
+                if tile_count <= 500:
+                    zoom = z
+                    break
+
+            print(f"[predict_ortho] zoom={zoom}, tiles={tile_count} ({x_min}-{x_max}, {y_min}-{y_max})")
+
+            TILE_SIZE = 256
+            width = (x_max - x_min + 1) * TILE_SIZE
+            height = (y_max - y_min + 1) * TILE_SIZE
+            stitched = Image.new("RGB", (width, height), (0, 0, 0))
+
+            # Fetch tiles in parallel
+            def fetch_tile(tx, ty):
+                key = f"{tiles_key.rstrip('/')}/{zoom}/{tx}/{ty}.webp"
+                try:
+                    resp = s3.get_object(Bucket=bucket, Key=key)
+                    return tx, ty, Image.open(io.BytesIO(resp["Body"].read())).convert("RGB")
+                except Exception:
+                    return tx, ty, None
+
+            coords = [(tx, ty) for tx in range(x_min, x_max + 1) for ty in range(y_min, y_max + 1)]
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                for tx, ty, tile_img in ex.map(lambda c: fetch_tile(*c), coords):
+                    if tile_img:
+                        px = (tx - x_min) * TILE_SIZE
+                        py = (ty - y_min) * TILE_SIZE
+                        stitched.paste(tile_img, (px, py))
+
+            print(f"[predict_ortho] stitched image size: {stitched.size}")
+
+            # Run inference on the stitched image
+            raw_pts = self._infer_image(stitched, model, model_type, num_context_frames,
+                                        score_thresh, iou_thresh)
+
+            # Convert pixel coords → lat/lng
+            points_list = []
+            for p in raw_pts:
+                lng, lat = _pixel_to_latlon(p["x"], p["y"], zoom, x_min, y_min, TILE_SIZE)
+                points_list.append({"lng": round(lng, 8), "lat": round(lat, 8), "score": p["score"]})
+
+            return {
+                "points": points_list,
+                "count": len(points_list),
+                "model_parameters": {
+                    "model_type": model_type,
+                    "num_context_frames": num_context_frames,
+                    "zoom_used": zoom,
+                    "tile_count": tile_count,
+                    "checkpoint_used": checkpoint_path,
+                },
             }
 
         return web_app
