@@ -794,7 +794,7 @@ class SalmonInferenceServer:
             if not tile_server_url or not tile_server_token or not ortho_key:
                 raise HTTPException(status_code=400, detail="Missing tile_server_url, tile_server_token, or ortho_key")
 
-            checkpoint_path = resolve_checkpoint(checkpoint_req)
+            checkpoint_path = resolve_checkpoint(checkpoint_req or DEFAULT_CHECKPOINT)
             model, model_type, num_context_frames, _ = self.get_model(checkpoint_path)
 
             minlng, minlat, maxlng, maxlat = bounds
