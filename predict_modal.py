@@ -778,12 +778,11 @@ class SalmonInferenceServer:
             import requests as http_requests
 
             bounds = data.get("bounds")  # [minlng, minlat, maxlng, maxlat]
-            zoom = int(data.get("zoom", 20))
+            zoom = int(data.get("zoom", 22))
             score_thresh = float(data.get("score_thresh", 0.25))
             iou_thresh = float(data.get("iou_thresh", 0.5))
             checkpoint_req = data.get("checkpoint_path")
 
-            # Tile server params (preferred path — tiles served dynamically)
             tile_server_url = data.get("tile_server_url")
             tile_server_token = data.get("tile_server_token")
             ortho_key = data.get("ortho_key")
@@ -799,24 +798,22 @@ class SalmonInferenceServer:
 
             minlng, minlat, maxlng, maxlat = bounds
 
-            # Find tile range at chosen zoom, capping tile count to avoid OOM
+            # Use native zoom, cap at 2000 tiles (processed individually, not stitched)
             tile_count = 9999
-            for z in range(zoom, max(zoom - 4, 14) - 1, -1):
-                x_min, y_min = _latlon_to_tile(z, maxlat, minlng)  # top-left
-                x_max, y_max = _latlon_to_tile(z, minlat, maxlng)  # bottom-right
+            for z in range(zoom, max(zoom - 6, 14) - 1, -1):
+                x_min, y_min = _latlon_to_tile(z, maxlat, minlng)
+                x_max, y_max = _latlon_to_tile(z, minlat, maxlng)
                 tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
-                if tile_count <= 500:
+                if tile_count <= 2000:
                     zoom = z
                     break
 
             print(f"[predict_ortho] zoom={zoom}, tiles={tile_count} ({x_min}-{x_max}, {y_min}-{y_max})")
 
             TILE_SIZE = 256
-            width = (x_max - x_min + 1) * TILE_SIZE
-            height = (y_max - y_min + 1) * TILE_SIZE
-            stitched = Image.new("RGB", (width, height), (0, 0, 0))
+            INFER_SIZE = 512  # resize each tile to 512×512 for model input
 
-            # Fetch tiles from the dynamic tile server in parallel
+            # Fetch all tiles in parallel
             session = http_requests.Session()
             session.headers.update({"Authorization": f"Bearer {tile_server_token}"})
 
@@ -836,33 +833,58 @@ class SalmonInferenceServer:
                 return tx, ty, None
 
             coords = [(tx, ty) for tx in range(x_min, x_max + 1) for ty in range(y_min, y_max + 1)]
+            tile_images = {}
             with ThreadPoolExecutor(max_workers=16) as ex:
-                for tx, ty, tile_img in ex.map(lambda c: fetch_tile(*c), coords):
-                    if tile_img:
-                        px = (tx - x_min) * TILE_SIZE
-                        py = (ty - y_min) * TILE_SIZE
-                        stitched.paste(tile_img, (px, py))
+                for tx, ty, img in ex.map(lambda c: fetch_tile(*c), coords):
+                    if img is not None:
+                        tile_images[(tx, ty)] = img
 
-            print(f"[predict_ortho] stitched image size: {stitched.size}")
+            print(f"[predict_ortho] fetched {len(tile_images)}/{tile_count} tiles")
 
-            # Run inference on the stitched image
-            raw_pts = self._infer_image(stitched, model, model_type, num_context_frames,
-                                        score_thresh, iou_thresh)
+            # Run inference on each tile individually (resized to INFER_SIZE×INFER_SIZE)
+            # Fish at zoom 22 are ~20px in 256-px tiles → ~40px after 2× resize = model-friendly scale
+            _normalize_fn = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+            geo_points = []
 
-            # Convert pixel coords → lat/lng
-            points_list = []
-            for p in raw_pts:
-                lng, lat = _pixel_to_latlon(p["x"], p["y"], zoom, x_min, y_min, TILE_SIZE)
-                points_list.append({"lng": round(lng, 8), "lat": round(lat, 8), "score": p["score"]})
+            with torch.no_grad():
+                for (tx, ty), tile_img in tile_images.items():
+                    tile_resized = tile_img.resize((INFER_SIZE, INFER_SIZE), Image.BILINEAR)
+                    pv = _normalize_fn(T.functional.to_tensor(tile_resized)).unsqueeze(0).cuda()
+                    pm = torch.ones(1, INFER_SIZE, INFER_SIZE, dtype=torch.long).cuda()
+
+                    if model_type == "detr":
+                        out = model(pixel_values=pv, pixel_mask=pm)
+                        probs = out.logits.cpu()[0].softmax(-1)[:, 0]
+                        b = out.pred_boxes.cpu()[0]
+                        keep = probs > score_thresh
+                        if keep.any():
+                            b_k = b[keep]
+                            s_k = probs[keep]
+                            # NMS in tile pixel space (256-px coords)
+                            bsize = 10.0
+                            cx_px = b_k[:, 0] * TILE_SIZE
+                            cy_px = b_k[:, 1] * TILE_SIZE
+                            boxes_xyxy = torch.stack([cx_px - bsize, cy_px - bsize,
+                                                      cx_px + bsize, cy_px + bsize], 1)
+                            kept_idx = tv_nms(boxes_xyxy, s_k, iou_threshold=iou_thresh)
+                            for idx in kept_idx.tolist():
+                                col = b_k[idx, 0].item() * TILE_SIZE
+                                row = b_k[idx, 1].item() * TILE_SIZE
+                                lng, lat = _pixel_to_latlon(col, row, zoom, tx, ty, TILE_SIZE)
+                                geo_points.append({"lng": round(lng, 8), "lat": round(lat, 8),
+                                                   "score": round(s_k[idx].item(), 4)})
+
+            print(f"[predict_ortho] {len(geo_points)} detections at score_thresh={score_thresh}")
 
             return {
-                "points": points_list,
-                "count": len(points_list),
+                "points": geo_points,
+                "count": len(geo_points),
                 "model_parameters": {
                     "model_type": model_type,
                     "num_context_frames": num_context_frames,
                     "zoom_used": zoom,
                     "tile_count": tile_count,
+                    "tiles_fetched": len(tile_images),
                     "checkpoint_used": checkpoint_path,
                 },
             }
