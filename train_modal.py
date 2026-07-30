@@ -83,6 +83,7 @@ def main(
     workers: int = 8,
     verbose: bool = False,
     mlflow_tracking_uri: str = None,
+    resume: str = None,
 ):
     if name:
         run_name = f"runs/{name}"
@@ -114,6 +115,8 @@ def main(
     # Falls back to MLFLOW_TRACKING_URI in .env (propagated as a Modal secret) if not passed here.
     if mlflow_tracking_uri is not None:
         kwargs["mlflow_tracking_uri"] = mlflow_tracking_uri
+    if resume is not None:
+        kwargs["resume"] = resume
         
     print(f"Launching remote {model} training on Modal (saving logs to {run_name})...")
     run_handle = run_remote_training.spawn(model, kwargs)
