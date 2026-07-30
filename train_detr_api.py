@@ -338,6 +338,7 @@ def main(
     mlflow_tracking_uri: str = None,   # e.g. 'file:./mlruns' or a remote server URI; default local ./mlruns
     mlflow_experiment: str = 'salmon-enumeration',
     mlflow:       str   = None,        # override MLflow run name (skips auto-resume for that name)
+    fresh_finetune: bool = False,
     use_video_data: bool = True,
     use_ortho_data: bool = True,
     tile_server_url: str = None,
@@ -371,6 +372,14 @@ def main(
         pretrained:   Load facebook/detr-resnet-50 weights.
         mlflow_tracking_uri: MLflow tracking URI. Defaults to local ./mlruns if not given.
         mlflow_experiment: MLflow experiment name.
+        fresh_finetune: Set True when --resume points at a DIFFERENT completed run's
+            checkpoint (e.g. the currently-deployed production model) rather than
+            continuing this exact same interrupted experiment. Loads model weights only —
+            epoch/global_step reset to 0 and the LR scheduler starts a fresh warmup+decay
+            curve using this run's own --lr/--warmup_steps/--decay_steps, instead of
+            inheriting the source checkpoint's scheduler position (which otherwise silently
+            resumes wherever THAT run's schedule had already decayed to, potentially near
+            zero, defeating the point of a deliberately-configured fine-tune).
         use_video_data: Pull ground truth from /api/v1/labeling-tasks (raw video/photo
             crops). Set to False (with use_ortho_data=True) to train an ortho-only model
             for comparison against a merged run.
@@ -545,7 +554,7 @@ def main(
                     'num_context_frames': num_context_frames, 'context_stride': context_stride,
                     'pretrained': pretrained, 'temporal_fusion': temporal_fusion,
                     'use_video_data': use_video_data, 'use_ortho_data': use_ortho_data,
-                    'ortho_stitch_radius': ortho_stitch_radius,
+                    'ortho_stitch_radius': ortho_stitch_radius, 'fresh_finetune': fresh_finetune,
                 })
         except Exception as e:
             print(f"Warning: Failed to start MLflow run: {e}. Disabling MLflow tracking for this run.", flush=True)
@@ -790,15 +799,24 @@ def main(
         if os.path.isfile(resume):
             ckpt = torch.load(resume, map_location='cuda')
             model.load_state_dict(ckpt['state_dict'], strict=False)
-            start_epoch = ckpt.get('epoch', 0)
-            best_mae    = ckpt.get('best_mae', 1e9)
-            global_step = ckpt.get('global_step', 0)
-            if 'scheduler' in ckpt:
-                try:
-                    scheduler.load_state_dict(ckpt['scheduler'])
-                except Exception:
-                    pass
-            print(f'Resumed from downloaded MLflow checkpoint: {resume}  (epoch {start_epoch}, best MAE {best_mae:.2f}, step {global_step})', flush=True)
+            if fresh_finetune:
+                # Weights only — this checkpoint came from a different run/experiment.
+                # Do NOT inherit its epoch/global_step/scheduler position; start a fresh
+                # warmup+decay curve using this run's own lr/warmup_steps/decay_steps.
+                start_epoch = 0
+                best_mae    = 1e9
+                global_step = 0
+                print(f'Fresh fine-tune from checkpoint: {resume}  (weights only — fresh epoch/LR schedule)', flush=True)
+            else:
+                start_epoch = ckpt.get('epoch', 0)
+                best_mae    = ckpt.get('best_mae', 1e9)
+                global_step = ckpt.get('global_step', 0)
+                if 'scheduler' in ckpt:
+                    try:
+                        scheduler.load_state_dict(ckpt['scheduler'])
+                    except Exception:
+                        pass
+                print(f'Resumed from downloaded MLflow checkpoint: {resume}  (epoch {start_epoch}, best MAE {best_mae:.2f}, step {global_step})', flush=True)
             checkpoint_loaded = True
             
         if not checkpoint_loaded:
