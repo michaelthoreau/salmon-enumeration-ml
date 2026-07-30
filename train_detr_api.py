@@ -196,7 +196,7 @@ NUM_CLASSES   = 1   # fish (background is implicit class inside DETR)
 # API-Driven Dataset
 # ---------------------------------------------------------------------------
 
-from dataset_api import SockeyeApiDataset, SameFrameBatchSampler
+from dataset_api import SockeyeApiDataset, SameFrameBatchSampler, ORTHO_TILE_SIZE
 
 
 def collate_fn(batch):
@@ -338,6 +338,10 @@ def main(
     mlflow_tracking_uri: str = None,   # e.g. 'file:./mlruns' or a remote server URI; default local ./mlruns
     mlflow_experiment: str = 'salmon-enumeration',
     mlflow:       str   = None,        # override MLflow run name (skips auto-resume for that name)
+    use_ortho_data: bool = True,
+    tile_server_url: str = None,
+    tile_server_token: str = None,
+    ortho_stitch_radius: int = 1,
 ):
     """Train DETR on salmon crop tasks pulled from Sockeye API.
 
@@ -366,6 +370,13 @@ def main(
         pretrained:   Load facebook/detr-resnet-50 weights.
         mlflow_tracking_uri: MLflow tracking URI. Defaults to local ./mlruns if not given.
         mlflow_experiment: MLflow experiment name.
+        use_ortho_data: Also pull ground truth from /api/v1/ortho-tasks (real orthomosaic
+            annotations) and merge into the combined train/val pool. Requires
+            tile_server_url/tile_server_token to be set (directly or via .env).
+        tile_server_url: Base URL of the ortho tile server (same one /predict_ortho uses).
+        tile_server_token: Bearer token for the tile server.
+        ortho_stitch_radius: Neighboring-tile radius stitched around each ortho task's
+            center tile (1 -> 3x3 grid of 256px tiles = 768x768).
     """
     from transformers import DetrForObjectDetection, DetrConfig
 
@@ -378,6 +389,18 @@ def main(
         raise ValueError(
             "Sockeye API Key is required. Please set it in .env as SOCKEYE_API_KEY or pass it via --api_key."
         )
+
+    if tile_server_url is None:
+        tile_server_url = os.environ.get("MODAL_TILE_SERVER_URL")
+    if tile_server_token is None:
+        tile_server_token = os.environ.get("MODAL_TILE_TOKEN")
+    if use_ortho_data and not (tile_server_url and tile_server_token):
+        print(
+            "Warning: use_ortho_data=True but tile_server_url/tile_server_token not set "
+            "(set MODAL_TILE_SERVER_URL/MODAL_TILE_TOKEN in .env or pass explicitly). "
+            "Skipping ortho data for this run.", flush=True
+        )
+        use_ortho_data = False
 
     base = os.path.dirname(os.path.abspath(__file__))
     auto_name = mlflow if mlflow else _auto_run_name(num_context_frames, context_stride, temporal_fusion)
@@ -517,6 +540,7 @@ def main(
                     'score_thresh': score_thresh, 'limit_batches': limit_batches, 'min_batches': min_batches,
                     'num_context_frames': num_context_frames, 'context_stride': context_stride,
                     'pretrained': pretrained, 'temporal_fusion': temporal_fusion,
+                    'use_ortho_data': use_ortho_data, 'ortho_stitch_radius': ortho_stitch_radius,
                 })
         except Exception as e:
             print(f"Warning: Failed to start MLflow run: {e}. Disabling MLflow tracking for this run.", flush=True)
@@ -534,7 +558,7 @@ def main(
     print(f'API Url   : {api_url}', flush=True)
     print(f'Epochs    : {epochs}  |  Batch: {batch_size}  |  LR: {lr}  |  Box: {box_size}px', flush=True)
 
-    # 1. Fetch completed tasks from API
+    # 1. Fetch completed tasks from API (raw video/photo crops)
     headers = {"Authorization": f"Bearer {api_key}"}
     tasks = []
     limit = 500
@@ -549,33 +573,76 @@ def main(
             break
         tasks.extend(data)
         offset += limit
-        
+
     tasks = [t for t in tasks if len(t.get("points", [])) > 0]
     print(f"Loaded {len(tasks)} completed labeling tasks with fish from Sockeye API.", flush=True)
+
+    # 1b. Fetch real orthomosaic ground truth (annotations placed directly on the
+    # ortho map) and merge in, so the model sees post-stitch pixels during training
+    # instead of only raw video/photo crops.
+    if use_ortho_data:
+        ortho_tasks = []
+        offset = 0
+        while True:
+            url = f"{api_url}/ortho-tasks?limit={limit}&offset={offset}"
+            res = requests.get(url, headers=headers)
+            if res.status_code != 200:
+                raise RuntimeError(f"Failed to fetch ortho tasks: {res.status_code} - {res.text}")
+            data = res.json()
+            if not data:
+                break
+            ortho_tasks.extend(data)
+            offset += limit
+
+        ortho_tasks = [t for t in ortho_tasks if len(t.get("points", [])) > 0]
+        print(f"Loaded {len(ortho_tasks)} ortho tasks with fish from Sockeye API.", flush=True)
+        tasks.extend(ortho_tasks)
+
     if not tasks:
         print("Error: No tasks with fish found in Sockeye API.")
         return
 
-    # 2. Split tasks into train/val
+    # 2. Split into train/val BY FLIGHT, not by individual task — a flat shuffle
+    # over tasks would leak the same flight's imagery/conditions across both
+    # sets, which matters a lot here given the ortho ground truth is heavily
+    # skewed toward a handful of flights.
     random.seed(42)
-    random.shuffle(tasks)
-    split_idx = int(len(tasks) * 0.9)
-    train_tasks = tasks[:split_idx]
-    val_tasks   = tasks[split_idx:]
-    print(f"Split: {len(train_tasks)} train tasks  |  {len(val_tasks)} val tasks", flush=True)
+    tasks_by_flight = {}
+    for t in tasks:
+        fid = t.get("flightId") or f"__no_flight__{id(t)}"
+        tasks_by_flight.setdefault(fid, []).append(t)
+
+    flight_ids = list(tasks_by_flight.keys())
+    random.shuffle(flight_ids)
+    split_idx = max(1, int(len(flight_ids) * 0.9))
+    train_flight_ids = flight_ids[:split_idx]
+    val_flight_ids = flight_ids[split_idx:]
+
+    train_tasks = [t for fid in train_flight_ids for t in tasks_by_flight[fid]]
+    val_tasks   = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
+    random.shuffle(train_tasks)
+    random.shuffle(val_tasks)
+    print(
+        f"Split: {len(train_flight_ids)} train flights ({len(train_tasks)} tasks)  |  "
+        f"{len(val_flight_ids)} val flights ({len(val_tasks)} tasks)", flush=True
+    )
 
     # 3. Create datasets & loaders
     train_ds = SockeyeApiDataset(
         api_url=api_url, api_key=api_key, tasks=train_tasks,
         cache_dir=cache_dir, img_size=img_size, box_size=box_size,
         augment=True, num_context_frames=num_context_frames, context_stride=context_stride,
-        verbose=verbose, mode="detr"
+        verbose=verbose, mode="detr",
+        tile_server_url=tile_server_url, tile_server_token=tile_server_token,
+        ortho_stitch_radius=ortho_stitch_radius,
     )
     val_ds = SockeyeApiDataset(
         api_url=api_url, api_key=api_key, tasks=val_tasks,
         cache_dir=cache_dir, img_size=img_size, box_size=box_size,
         augment=False, num_context_frames=num_context_frames, context_stride=context_stride,
-        verbose=verbose, mode="detr"
+        verbose=verbose, mode="detr",
+        tile_server_url=tile_server_url, tile_server_token=tile_server_token,
+        ortho_stitch_radius=ortho_stitch_radius,
     )
 
     batch_sampler = SameFrameBatchSampler(len(train_ds), batch_size)
@@ -795,6 +862,7 @@ def main(
     def validate(epoch):
         model.eval()
         mae = mse = 0.0
+        origin_stats = {'video': {'mae': 0.0, 'mse': 0.0, 'n': 0}, 'ortho': {'mae': 0.0, 'mse': 0.0, 'n': 0}}
         n = 0
         debug_saved = False
         _normalize_fn = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
@@ -862,6 +930,11 @@ def main(
             
             # Get points (these are absolute coordinates!)
             points = [[pt["x"], pt["y"]] for pt in task.get("points", [])]
+            if file_id.startswith("ortho:"):
+                # Same coordinate-space shift as SockeyeApiDataset.__getitem__:
+                # exported points are relative to the task's center tile only.
+                margin = val_ds.ortho_stitch_radius * ORTHO_TILE_SIZE
+                points = [[px + margin, py + margin] for px, py in points]
             gt_count = len(points)
             
             # Make tiles of size S from the crop
@@ -901,7 +974,12 @@ def main(
             mae += abs(err)
             mse += err * err
             n += 1
-            
+
+            origin = 'ortho' if file_id.startswith("ortho:") else 'video'
+            origin_stats[origin]['mae'] += abs(err)
+            origin_stats[origin]['mse'] += err * err
+            origin_stats[origin]['n'] += 1
+
             # Save debug crop to TensorBoard (using first image)
             if not debug_saved:
                 debug_saved = True
@@ -973,6 +1051,18 @@ def main(
         log_metric('val/loss_ce',    val_loss_dict.get('loss_ce', 0.0) / num_batches, epoch)
         log_metric('val/loss_bbox',  val_loss_dict.get('loss_bbox', 0.0) / num_batches, epoch)
         log_metric('val/loss_giou',  val_loss_dict.get('loss_giou', 0.0) / num_batches, epoch)
+
+        # Per-origin breakdown (video vs. ortho) — lets us tell "ortho didn't
+        # improve" apart from "video regressed" (catastrophic forgetting) when
+        # fine-tuning on the merged task pool, rather than only seeing one
+        # combined number.
+        for origin, stats in origin_stats.items():
+            if stats['n'] > 0:
+                o_mae = stats['mae'] / stats['n']
+                o_rmse = (stats['mse'] / stats['n']) ** 0.5
+                log_metric(f'val/count_mae_{origin}', o_mae, epoch)
+                log_metric(f'val/count_rmse_{origin}', o_rmse, epoch)
+                print(f'  Val[{origin}]  MAE={o_mae:.2f}  RMSE={o_rmse:.2f}  (n={stats["n"]})', flush=True)
 
         if n == 0:
             return 1e9

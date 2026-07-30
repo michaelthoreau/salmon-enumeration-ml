@@ -3,6 +3,8 @@ import io
 import time
 import math
 import random
+import hashlib
+import urllib.parse
 import requests
 import numpy as np
 import scipy.spatial
@@ -11,6 +13,8 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
 from functools import lru_cache
+
+ORTHO_TILE_SIZE = 256
 
 class SameFrameBatchSampler(torch.utils.data.Sampler):
     def __init__(self, dataset_size, batch_size):
@@ -100,7 +104,8 @@ def generate_heatmap(points, shape=(512, 512), sigma=4.0):
 class SockeyeApiDataset(Dataset):
     def __init__(self, api_url, api_key, tasks, cache_dir="/tmp/frame_cache",
                  img_size=512, augment=False, num_context_frames=1, context_stride=5,
-                 box_size=50, sigma=4.0, verbose=False, mode="iocformer"):
+                 box_size=50, sigma=4.0, verbose=False, mode="iocformer",
+                 tile_server_url=None, tile_server_token=None, ortho_stitch_radius=1):
         """
         Args:
             api_url (str): Base URL of API
@@ -115,6 +120,13 @@ class SockeyeApiDataset(Dataset):
             sigma (float): Sigma for Gaussian heatmap generation (used for CNN mode)
             verbose (bool): If True, print detailed timing logs
             mode (str): One of "iocformer", "detr", "cnn"
+            tile_server_url (str): Base URL of the ortho tile server (required if any
+                task has an orthoKey, i.e. comes from /api/v1/ortho-tasks)
+            tile_server_token (str): Bearer token for the tile server
+            ortho_stitch_radius (int): Neighboring-tile radius to stitch around an ortho
+                task's center tile (1 -> 3x3 grid). A single 256px tile is smaller than
+                img_size, which would always take the plain-resize path in __getitem__
+                and skip random-crop augmentation; stitching gives that branch room.
         """
         self.api_url = api_url.rstrip('/')
         self.headers = {"Authorization": f"Bearer {api_key}"}
@@ -130,14 +142,106 @@ class SockeyeApiDataset(Dataset):
         self.sigma = sigma
         self.verbose = verbose
         self.mode = mode
-        
+
+        self.tile_server_url = tile_server_url.rstrip('/') if tile_server_url else None
+        self.tile_server_token = tile_server_token
+        self.ortho_stitch_radius = ortho_stitch_radius
+        self._ortho_lookup = {}
+        for t in tasks:
+            fid = t.get("fileId", "")
+            if fid.startswith("ortho:") and t.get("orthoKey") is not None:
+                self._ortho_lookup[fid] = {
+                    "z": t["tileZ"], "x": t["tileX"], "y": t["tileY"],
+                    "orthoKey": t["orthoKey"], "bucket": t.get("bucket", ""),
+                }
+
         os.makedirs(cache_dir, exist_ok=True)
 
     def __len__(self):
         return len(self.tasks)
 
+    def _get_ortho_tile_raw(self, ortho_key, bucket, z, tx, ty):
+        """Downloads and caches a single ORTHO_TILE_SIZE ortho tile as a PIL Image,
+        fetched from the same tile server /predict_ortho uses at inference time."""
+        key_hash = hashlib.md5(ortho_key.encode()).hexdigest()[:12]
+        cache_path = os.path.join(self.cache_dir, f"ortho_{key_hash}_{z}_{tx}_{ty}.jpg")
+
+        if os.path.exists(cache_path):
+            try:
+                return Image.open(cache_path).convert("RGB")
+            except Exception:
+                try:
+                    os.remove(cache_path)
+                except Exception:
+                    pass
+
+        url = (
+            f"{self.tile_server_url}/tiles/{z}/{tx}/{ty}"
+            f"?key={urllib.parse.quote(ortho_key, safe='')}"
+            f"&bucket={urllib.parse.quote(bucket, safe='')}"
+            f"&tilesize={ORTHO_TILE_SIZE}"
+        )
+        headers = {"Authorization": f"Bearer {self.tile_server_token}"}
+
+        img_bytes = None
+        for attempt in range(3):
+            try:
+                res = requests.get(url, headers=headers, timeout=15)
+                if res.status_code == 200:
+                    img_bytes = res.content
+                    break
+                elif res.status_code == 429:
+                    time.sleep(random.uniform(1.0, 3.0))
+                else:
+                    time.sleep(random.uniform(0.5, 1.5))
+            except Exception:
+                time.sleep(random.uniform(1.0, 3.0))
+
+        if img_bytes is None:
+            # Neighboring tile may legitimately fall outside the ortho's coverage
+            # (edge of flight) — return blank rather than failing the whole stitch.
+            return Image.new("RGB", (ORTHO_TILE_SIZE, ORTHO_TILE_SIZE), (0, 0, 0))
+
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        tmp_path = cache_path + f".tmp.{os.getpid()}.{random.randint(0, 100000)}"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(img_bytes)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        return img
+
+    def _get_ortho_tiles_stitched(self, file_id):
+        """Fetches a (2*radius+1)^2 neighborhood of ortho tiles around the task's
+        center tile and stitches them into one square image. The task's own
+        points stay relative to just the center tile — callers (__getitem__,
+        validate()) are responsible for shifting them by +radius*ORTHO_TILE_SIZE
+        into this canvas's coordinate space."""
+        info = self._ortho_lookup[file_id]
+        z, cx, cy = info["z"], info["x"], info["y"]
+        ortho_key, bucket = info["orthoKey"], info["bucket"]
+
+        r = self.ortho_stitch_radius
+        n = 2 * r + 1
+        canvas = Image.new("RGB", (n * ORTHO_TILE_SIZE, n * ORTHO_TILE_SIZE))
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                tile_img = self._get_ortho_tile_raw(ortho_key, bucket, z, cx + dx, cy + dy)
+                canvas.paste(tile_img, ((dx + r) * ORTHO_TILE_SIZE, (dy + r) * ORTHO_TILE_SIZE))
+        return canvas
+
     @lru_cache(maxsize=64)
     def _get_full_frame(self, file_id, frame_num):
+        if file_id.startswith("ortho:"):
+            return self._get_ortho_tiles_stitched(file_id)
+
         t0 = time.time()
         # Always use the full frame cache path
         cache_path = os.path.join(self.cache_dir, f"{file_id}_{frame_num:06d}.jpg")
@@ -236,6 +340,12 @@ class SockeyeApiDataset(Dataset):
             H_crop = y2 - y1
             
         points = [[pt["x"], pt["y"]] for pt in task.get("points", [])]
+        if file_id.startswith("ortho:"):
+            # Exported points are relative to just the task's center tile, but
+            # _get_full_frame returns the whole stitched (2*radius+1)-tile canvas
+            # for ortho tasks — shift into that canvas's coordinate space.
+            margin = self.ortho_stitch_radius * ORTHO_TILE_SIZE
+            points = [[px + margin, py + margin] for px, py in points]
         S = self.img_size
         
         t0 = time.time()
