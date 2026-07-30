@@ -338,6 +338,7 @@ def main(
     mlflow_tracking_uri: str = None,   # e.g. 'file:./mlruns' or a remote server URI; default local ./mlruns
     mlflow_experiment: str = 'salmon-enumeration',
     mlflow:       str   = None,        # override MLflow run name (skips auto-resume for that name)
+    use_video_data: bool = True,
     use_ortho_data: bool = True,
     tile_server_url: str = None,
     tile_server_token: str = None,
@@ -370,6 +371,9 @@ def main(
         pretrained:   Load facebook/detr-resnet-50 weights.
         mlflow_tracking_uri: MLflow tracking URI. Defaults to local ./mlruns if not given.
         mlflow_experiment: MLflow experiment name.
+        use_video_data: Pull ground truth from /api/v1/labeling-tasks (raw video/photo
+            crops). Set to False (with use_ortho_data=True) to train an ortho-only model
+            for comparison against a merged run.
         use_ortho_data: Also pull ground truth from /api/v1/ortho-tasks (real orthomosaic
             annotations) and merge into the combined train/val pool. Requires
             tile_server_url/tile_server_token to be set (directly or via .env).
@@ -540,7 +544,8 @@ def main(
                     'score_thresh': score_thresh, 'limit_batches': limit_batches, 'min_batches': min_batches,
                     'num_context_frames': num_context_frames, 'context_stride': context_stride,
                     'pretrained': pretrained, 'temporal_fusion': temporal_fusion,
-                    'use_ortho_data': use_ortho_data, 'ortho_stitch_radius': ortho_stitch_radius,
+                    'use_video_data': use_video_data, 'use_ortho_data': use_ortho_data,
+                    'ortho_stitch_radius': ortho_stitch_radius,
                 })
         except Exception as e:
             print(f"Warning: Failed to start MLflow run: {e}. Disabling MLflow tracking for this run.", flush=True)
@@ -558,24 +563,30 @@ def main(
     print(f'API Url   : {api_url}', flush=True)
     print(f'Epochs    : {epochs}  |  Batch: {batch_size}  |  LR: {lr}  |  Box: {box_size}px', flush=True)
 
+    if not use_video_data and not use_ortho_data:
+        raise ValueError("At least one of use_video_data / use_ortho_data must be True.")
+
     # 1. Fetch completed tasks from API (raw video/photo crops)
     headers = {"Authorization": f"Bearer {api_key}"}
     tasks = []
     limit = 500
-    offset = 0
-    while True:
-        url = f"{api_url}/labeling-tasks?completed=true&limit={limit}&offset={offset}"
-        res = requests.get(url, headers=headers)
-        if res.status_code != 200:
-            raise RuntimeError(f"Failed to fetch tasks: {res.status_code} - {res.text}")
-        data = res.json()
-        if not data:
-            break
-        tasks.extend(data)
-        offset += limit
+    if use_video_data:
+        offset = 0
+        while True:
+            url = f"{api_url}/labeling-tasks?completed=true&limit={limit}&offset={offset}"
+            res = requests.get(url, headers=headers)
+            if res.status_code != 200:
+                raise RuntimeError(f"Failed to fetch tasks: {res.status_code} - {res.text}")
+            data = res.json()
+            if not data:
+                break
+            tasks.extend(data)
+            offset += limit
 
-    tasks = [t for t in tasks if len(t.get("points", [])) > 0]
-    print(f"Loaded {len(tasks)} completed labeling tasks with fish from Sockeye API.", flush=True)
+        tasks = [t for t in tasks if len(t.get("points", [])) > 0]
+        print(f"Loaded {len(tasks)} completed labeling tasks with fish from Sockeye API.", flush=True)
+    else:
+        print("Skipping video/photo labeling tasks (use_video_data=False) — ortho-only run.", flush=True)
 
     # 1b. Fetch real orthomosaic ground truth (annotations placed directly on the
     # ortho map) and merge in, so the model sees post-stitch pixels during training
