@@ -44,7 +44,8 @@ cache_nfs = modal.NetworkFileSystem.from_name("salmon-cache-nfs", create_if_miss
         "/tmp/frame_cache": cache_nfs,
     },
     secrets=[modal.Secret.from_dotenv()],
-    timeout=14400, # 4-hour timeout limit
+    timeout=28800, # 8-hour timeout limit — raised after a run hit the previous 4h ceiling
+                   # mid-epoch due to unusually slow data-fetch latency that session
 )
 def run_remote_training(model_type, kwargs):
     import sys
