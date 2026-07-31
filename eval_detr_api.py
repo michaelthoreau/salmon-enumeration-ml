@@ -20,6 +20,8 @@ import time
 import random
 import warnings
 import json
+import hashlib
+import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Tuple, Any
 
@@ -54,6 +56,7 @@ _load_dotenv()
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 NUM_CLASSES   = 1   # fish
+ORTHO_TILE_SIZE = 256
 
 # ---------------------------------------------------------------------------
 # Centroid NMS
@@ -441,6 +444,80 @@ def get_frame(api_url: str, api_key: str, file_id: str, frame_num: int, cache_di
         pass
     return img
 
+def get_ortho_tile_raw(
+    tile_server_url: str, tile_server_token: str,
+    ortho_key: str, bucket: str, z: int, tx: int, ty: int, cache_dir: str
+) -> Image.Image:
+    """Downloads and caches a single ortho tile, from the same tile server /predict_ortho
+    uses at inference time. Mirrors SockeyeApiDataset._get_ortho_tile_raw in dataset_api.py."""
+    os.makedirs(cache_dir, exist_ok=True)
+    key_hash = hashlib.md5(ortho_key.encode()).hexdigest()[:12]
+    cache_path = os.path.join(cache_dir, f"ortho_{key_hash}_{z}_{tx}_{ty}.jpg")
+
+    if os.path.exists(cache_path):
+        try:
+            return Image.open(cache_path).convert("RGB")
+        except Exception:
+            try:
+                os.remove(cache_path)
+            except Exception:
+                pass
+
+    url = (
+        f"{tile_server_url.rstrip('/')}/tiles/{z}/{tx}/{ty}"
+        f"?key={urllib.parse.quote(ortho_key, safe='')}"
+        f"&bucket={urllib.parse.quote(bucket, safe='')}"
+        f"&tilesize={ORTHO_TILE_SIZE}"
+    )
+    headers = {"Authorization": f"Bearer {tile_server_token}"}
+    img_bytes = None
+    for attempt in range(3):
+        try:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                img_bytes = res.content
+                break
+            elif res.status_code == 429:
+                time.sleep(random.uniform(1.0, 3.0))
+            else:
+                time.sleep(random.uniform(0.5, 1.5))
+        except Exception:
+            time.sleep(random.uniform(1.0, 3.0))
+
+    if img_bytes is None:
+        # Neighboring tile may legitimately fall outside the ortho's coverage.
+        return Image.new("RGB", (ORTHO_TILE_SIZE, ORTHO_TILE_SIZE), (0, 0, 0))
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    try:
+        tmp_path = cache_path + f".tmp.{os.getpid()}"
+        with open(tmp_path, "wb") as f:
+            f.write(img_bytes)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        pass
+    return img
+
+def get_ortho_frame(
+    task: dict, tile_server_url: str, tile_server_token: str, cache_dir: str, stitch_radius: int = 1
+) -> Image.Image:
+    """Fetches and stitches the (2*radius+1)^2 tile neighborhood around an ortho task's
+    center tile. Mirrors SockeyeApiDataset._get_ortho_tiles_stitched in dataset_api.py —
+    keep the stitch_radius in sync with whatever the model being evaluated was trained with."""
+    z, cx, cy = task["tileZ"], task["tileX"], task["tileY"]
+    ortho_key, bucket = task["orthoKey"], task.get("bucket", "")
+
+    r = stitch_radius
+    n = 2 * r + 1
+    canvas = Image.new("RGB", (n * ORTHO_TILE_SIZE, n * ORTHO_TILE_SIZE))
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            tile_img = get_ortho_tile_raw(
+                tile_server_url, tile_server_token, ortho_key, bucket, z, cx + dx, cy + dy, cache_dir
+            )
+            canvas.paste(tile_img, ((dx + r) * ORTHO_TILE_SIZE, (dy + r) * ORTHO_TILE_SIZE))
+    return canvas
+
 # ---------------------------------------------------------------------------
 # MLflow Artifact Downloader
 # ---------------------------------------------------------------------------
@@ -509,7 +586,13 @@ def evaluate(
     score_thresh: float = 0.25,
     nms_dist: float = 40.0,
     iou_thresholds: str = "0.1,0.25,0.5,0.75",
-    device: str = "cuda"
+    device: str = "cuda",
+    use_video_data: bool = True,
+    use_ortho_data: bool = False,
+    tile_server_url: str = None,
+    tile_server_token: str = None,
+    ortho_stitch_radius: int = 1,
+    flight_ids: str = None,
 ):
     """
     Evaluates DETR model predictions on Sockeye validation task set.
@@ -530,6 +613,18 @@ def evaluate(
         nms_dist: Centroid NMS distance suppression radius in pixels.
         iou_thresholds: Comma-separated list of standard IoU thresholds for evaluation (e.g. '0.1,0.25,0.5,0.75').
         device: PyTorch running device ('cuda' or 'cpu').
+        use_video_data: Include ground truth from /api/v1/labeling-tasks (raw video/photo crops).
+        use_ortho_data: Include ground truth from /api/v1/ortho-tasks (real orthomosaic annotations).
+            Requires tile_server_url/tile_server_token (directly or via .env).
+        tile_server_url: Base URL of the ortho tile server (same one /predict_ortho uses).
+        tile_server_token: Bearer token for the tile server.
+        ortho_stitch_radius: Neighboring-tile radius stitched around each ortho task's center
+            tile — MUST match whatever the checkpoint being evaluated was trained with.
+        flight_ids: Comma-separated list of flightIds to evaluate on. When set, this REPLACES
+            the random train/val split entirely — all matching tasks from these flights are
+            used as-is, no split applied. This is how to fairly compare two checkpoints that
+            were trained with different random splits: pick one fixed, explicit set of flights
+            that neither model trained on, and pass it here for both evaluation runs.
     """
     # 1. Resolve arguments from model_info.json if provided
     if model_info:
@@ -581,6 +676,18 @@ def evaluate(
     if not api_key:
         raise ValueError("Sockeye API Key is required. Set SOCKEYE_API_KEY in environment or pass --api_key.")
 
+    if tile_server_url is None:
+        tile_server_url = os.environ.get("MODAL_TILE_SERVER_URL")
+    if tile_server_token is None:
+        tile_server_token = os.environ.get("MODAL_TILE_TOKEN")
+    if use_ortho_data and not (tile_server_url and tile_server_token):
+        raise ValueError(
+            "use_ortho_data=True requires tile_server_url/tile_server_token "
+            "(set MODAL_TILE_SERVER_URL/MODAL_TILE_TOKEN in .env or pass explicitly)."
+        )
+    if not use_video_data and not use_ortho_data:
+        raise ValueError("At least one of use_video_data / use_ortho_data must be True.")
+
     # Parse IoU thresholds
     iou_thresh_list = [float(t.strip()) for t in iou_thresholds.split(",")]
     
@@ -588,32 +695,72 @@ def evaluate(
     device_obj = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     print(f"Running evaluation on device: {device_obj}", flush=True)
 
-    # 4. Fetch Completed Labeling Tasks from Sockeye API
-    print("Fetching labeling tasks from Sockeye API...", flush=True)
+    # 4. Fetch ground truth from Sockeye API
     headers = {"Authorization": f"Bearer {api_key}"}
-    tasks = []
     limit = 500
-    offset = 0
-    while True:
-        url = f"{api_url}/labeling-tasks?completed=true&limit={limit}&offset={offset}"
-        res = requests.get(url, headers=headers)
-        if res.status_code != 200:
-            raise RuntimeError(f"Failed to fetch tasks: {res.status_code} - {res.text}")
-        data = res.json()
-        if not data:
-            break
-        tasks.extend(data)
-        offset += limit
-        
-    tasks = [t for t in tasks if len(t.get("points", [])) > 0]
-    print(f"Loaded {len(tasks)} completed tasks with annotations.", flush=True)
-    
-    # Reproduce exactly the validation split from train_detr_api.py (seed=42)
-    random.seed(42)
-    random.shuffle(tasks)
-    split_idx = int(len(tasks) * 0.9)
-    val_tasks = tasks[split_idx:]
-    print(f"Evaluating on the validation split: {len(val_tasks)} tasks.", flush=True)
+    tasks = []
+
+    if use_video_data:
+        print("Fetching labeling tasks from Sockeye API...", flush=True)
+        offset = 0
+        while True:
+            url = f"{api_url}/labeling-tasks?completed=true&limit={limit}&offset={offset}"
+            res = requests.get(url, headers=headers)
+            if res.status_code != 200:
+                raise RuntimeError(f"Failed to fetch tasks: {res.status_code} - {res.text}")
+            data = res.json()
+            if not data:
+                break
+            tasks.extend(data)
+            offset += limit
+        tasks = [t for t in tasks if len(t.get("points", [])) > 0]
+        print(f"Loaded {len(tasks)} completed labeling tasks with annotations.", flush=True)
+
+    if use_ortho_data:
+        print("Fetching ortho tasks from Sockeye API...", flush=True)
+        ortho_tasks = []
+        offset = 0
+        while True:
+            url = f"{api_url}/ortho-tasks?limit={limit}&offset={offset}"
+            res = requests.get(url, headers=headers)
+            if res.status_code != 200:
+                raise RuntimeError(f"Failed to fetch ortho tasks: {res.status_code} - {res.text}")
+            data = res.json()
+            if not data:
+                break
+            ortho_tasks.extend(data)
+            offset += limit
+        ortho_tasks = [t for t in ortho_tasks if len(t.get("points", [])) > 0]
+        print(f"Loaded {len(ortho_tasks)} ortho tasks with annotations.", flush=True)
+        tasks.extend(ortho_tasks)
+
+    if flight_ids:
+        # Explicit, fixed flight set — bypasses the random split entirely. This is how to
+        # fairly compare two checkpoints trained with different random splits: pick one set
+        # of flights neither model trained on, and pass the same --flight_ids to both runs.
+        flight_id_set = {f.strip() for f in flight_ids.split(",") if f.strip()}
+        val_tasks = [t for t in tasks if t.get("flightId") in flight_id_set]
+        print(
+            f"Evaluating on explicit flight set ({len(flight_id_set)} flights): "
+            f"{len(val_tasks)} tasks.", flush=True
+        )
+    else:
+        # Reproduce the flight-aware validation split from train_detr_api.py (seed=42) —
+        # groups by flightId so a flight's data can't be split across train/val.
+        random.seed(42)
+        tasks_by_flight: Dict[str, list] = {}
+        for t in tasks:
+            fid = t.get("flightId") or f"__no_flight__{id(t)}"
+            tasks_by_flight.setdefault(fid, []).append(t)
+        flight_id_list = list(tasks_by_flight.keys())
+        random.shuffle(flight_id_list)
+        split_idx = max(1, int(len(flight_id_list) * 0.9))
+        val_flight_ids = flight_id_list[split_idx:]
+        val_tasks = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
+        print(
+            f"Evaluating on the flight-aware validation split: {len(val_flight_ids)} flights, "
+            f"{len(val_tasks)} tasks.", flush=True
+        )
 
     # 5. Initialize Model
     print("Building DETR model...", flush=True)
@@ -641,6 +788,7 @@ def evaluate(
     # Keep track of metrics
     all_abs_errors = []
     all_squared_errors = []
+    origin_abs_errors = {'video': [], 'ortho': []}
     
     # Store predictions & GT globally for AP and other stats
     # For each IoU threshold, we accumulate TP / FP / FN across the entire set
@@ -657,25 +805,29 @@ def evaluate(
         file_id = task["fileId"]
         frame_t = task["frame"]
         x1, y1, x2, y2 = task["x1"], task["y1"], task["x2"], task["y2"]
-        
-        # Load frame crop
+        is_ortho = file_id.startswith("ortho:")
+
+        # Load frame crop (ortho tasks fetch+stitch tiles; video/photo tasks download a frame)
         try:
-            pil_img = get_frame(api_url, api_key, file_id, frame_t, cache_dir)
+            if is_ortho:
+                pil_img = get_ortho_frame(task, tile_server_url, tile_server_token, cache_dir, ortho_stitch_radius)
+            else:
+                pil_img = get_frame(api_url, api_key, file_id, frame_t, cache_dir)
         except Exception as e:
-            print(f"Skipping frame {frame_t} file {file_id} due to fetch error: {e}", flush=True)
+            print(f"Skipping {'ortho tile' if is_ortho else 'frame'} {file_id} due to fetch error: {e}", flush=True)
             continue
-            
+
         W_full, H_full = pil_img.size
         if x2 <= x1 or y2 <= y1:
             x1, y1 = 0, 0
             x2, y2 = W_full, H_full
-            
+
         crop_pil = pil_img.crop((x1, y1, x2, y2))
         W_crop, H_crop = crop_pil.size
-        
-        # Companion context frames
+
+        # Companion context frames — not applicable to ortho tasks (no temporal sequence)
         companion_crops = []
-        if num_context_frames > 0:
+        if num_context_frames > 0 and not is_ortho:
             for n_idx in range(1, num_context_frames + 1):
                 frame_t_minus_np = max(0, frame_t - n_idx * context_stride)
                 crop_n = None
@@ -685,9 +837,14 @@ def evaluate(
                 except Exception:
                     pass
                 companion_crops.append(crop_n)
-                
+
         # Reconstruct GT boxes centered on the points
         points = [[pt["x"] - x1, pt["y"] - y1] for pt in task.get("points", [])]
+        if is_ortho:
+            # Exported points are relative to just the task's center tile — shift into the
+            # stitched canvas's coordinate space, same as SockeyeApiDataset.__getitem__.
+            margin = ortho_stitch_radius * ORTHO_TILE_SIZE
+            points = [[px + margin, py + margin] for px, py in points]
         gt_boxes = []
         half_box = box_size / 2.0
         for px, py in points:
@@ -747,6 +904,7 @@ def evaluate(
         count_err = pred_count - gt_count
         all_abs_errors.append(abs(count_err))
         all_squared_errors.append(count_err ** 2)
+        origin_abs_errors['ortho' if is_ortho else 'video'].append(abs(count_err))
 
         # Match predictions for each IoU threshold
         for iou in iou_thresh_list:
@@ -782,6 +940,9 @@ def evaluate(
     print(f"Mean Absolute Error (MAE) per img : {mae:.4f}")
     print(f"Root Mean Squared Error (RMSE)    : {rmse:.4f}")
     print(f"Max Absolute Error                : {np.max(all_abs_errors)}")
+    for origin, errs in origin_abs_errors.items():
+        if errs:
+            print(f"  [{origin}] n={len(errs)}  MAE={np.mean(errs):.4f}  RMSE={np.sqrt(np.mean(np.square(errs))):.4f}")
 
     print(f"\n============================================================")
     print(f"DETECTION METRICS (NMS centroid distance = {nms_dist}px)")
