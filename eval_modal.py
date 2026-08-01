@@ -18,6 +18,7 @@ image = (
         "requests",
         "python-dotenv",
         "fire",
+        "timm",
     )
     .add_local_dir(
         ".",
