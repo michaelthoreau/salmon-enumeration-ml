@@ -344,6 +344,7 @@ def main(
     tile_server_url: str = None,
     tile_server_token: str = None,
     ortho_stitch_radius: int = 1,
+    ortho_label: str = "fish",
 ):
     """Train DETR on salmon crop tasks pulled from Sockeye API.
 
@@ -390,6 +391,9 @@ def main(
         tile_server_token: Bearer token for the tile server.
         ortho_stitch_radius: Neighboring-tile radius stitched around each ortho task's
             center tile (1 -> 3x3 grid of 256px tiles = 768x768).
+        ortho_label: Which annotation label to pull from /api/v1/ortho-tasks — 'fish'
+            (default, migration/swimming counts) or 'spawning_salmon'. The two are
+            trained as separate models and must never be mixed into one run.
     """
     from transformers import DetrForObjectDetection, DetrConfig
 
@@ -555,6 +559,7 @@ def main(
                     'pretrained': pretrained, 'temporal_fusion': temporal_fusion,
                     'use_video_data': use_video_data, 'use_ortho_data': use_ortho_data,
                     'ortho_stitch_radius': ortho_stitch_radius, 'fresh_finetune': fresh_finetune,
+                    'ortho_label': ortho_label,
                 })
         except Exception as e:
             print(f"Warning: Failed to start MLflow run: {e}. Disabling MLflow tracking for this run.", flush=True)
@@ -604,7 +609,7 @@ def main(
         ortho_tasks = []
         offset = 0
         while True:
-            url = f"{api_url}/ortho-tasks?limit={limit}&offset={offset}"
+            url = f"{api_url}/ortho-tasks?label={ortho_label}&limit={limit}&offset={offset}"
             res = requests.get(url, headers=headers)
             if res.status_code != 200:
                 raise RuntimeError(f"Failed to fetch ortho tasks: {res.status_code} - {res.text}")
@@ -615,7 +620,7 @@ def main(
             offset += limit
 
         ortho_tasks = [t for t in ortho_tasks if len(t.get("points", [])) > 0]
-        print(f"Loaded {len(ortho_tasks)} ortho tasks with fish from Sockeye API.", flush=True)
+        print(f"Loaded {len(ortho_tasks)} ortho tasks (label={ortho_label}) from Sockeye API.", flush=True)
         tasks.extend(ortho_tasks)
 
     if not tasks:
@@ -633,19 +638,35 @@ def main(
         tasks_by_flight.setdefault(fid, []).append(t)
 
     flight_ids = list(tasks_by_flight.keys())
-    random.shuffle(flight_ids)
-    split_idx = max(1, int(len(flight_ids) * 0.9))
-    train_flight_ids = flight_ids[:split_idx]
-    val_flight_ids = flight_ids[split_idx:]
+    if len(flight_ids) > 1:
+        random.shuffle(flight_ids)
+        split_idx = max(1, int(len(flight_ids) * 0.9))
+        train_flight_ids = flight_ids[:split_idx]
+        val_flight_ids = flight_ids[split_idx:]
 
-    train_tasks = [t for fid in train_flight_ids for t in tasks_by_flight[fid]]
-    val_tasks   = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
-    random.shuffle(train_tasks)
-    random.shuffle(val_tasks)
-    print(
-        f"Split: {len(train_flight_ids)} train flights ({len(train_tasks)} tasks)  |  "
-        f"{len(val_flight_ids)} val flights ({len(val_tasks)} tasks)", flush=True
-    )
+        train_tasks = [t for fid in train_flight_ids for t in tasks_by_flight[fid]]
+        val_tasks   = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
+        random.shuffle(train_tasks)
+        random.shuffle(val_tasks)
+        print(
+            f"Split: {len(train_flight_ids)} train flights ({len(train_tasks)} tasks)  |  "
+            f"{len(val_flight_ids)} val flights ({len(val_tasks)} tasks)", flush=True
+        )
+    else:
+        # Flight-grouped splitting degenerates to an empty val set when there's
+        # only one flight in the pool (e.g. a spawning-salmon run trained on the
+        # single labeled ortho available so far). Fall back to a random split at
+        # the task/tile level in that case — there's no cross-flight leakage to
+        # guard against when there's only one flight to begin with.
+        shuffled = list(tasks)
+        random.shuffle(shuffled)
+        split_idx = max(1, int(len(shuffled) * 0.9))
+        train_tasks = shuffled[:split_idx]
+        val_tasks = shuffled[split_idx:]
+        print(
+            f"Only 1 flight in pool — splitting by task instead: "
+            f"{len(train_tasks)} train tasks | {len(val_tasks)} val tasks", flush=True
+        )
 
     # 3. Create datasets & loaders
     train_ds = SockeyeApiDataset(

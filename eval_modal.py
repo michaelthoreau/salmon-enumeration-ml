@@ -64,6 +64,7 @@ def main(
     score_thresh: float = 0.25,
     nms_dist: float = 40.0,
     iou_thresholds: str = "0.1,0.25,0.5,0.75",
+    ortho_label: str = "fish",
 ):
     if not checkpoint:
         raise ValueError("--checkpoint is required")
@@ -78,6 +79,7 @@ def main(
         "score_thresh": score_thresh,
         "nms_dist": nms_dist,
         "iou_thresholds": iou_thresholds,
+        "ortho_label": ortho_label,
     }
     if flight_ids is not None:
         kwargs["flight_ids"] = flight_ids

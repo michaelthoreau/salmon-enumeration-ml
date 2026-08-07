@@ -93,6 +93,7 @@ def main(
     tile_server_url: str = None,
     tile_server_token: str = None,
     ortho_stitch_radius: int = 1,
+    ortho_label: str = "fish",
 ):
     # save_path wins if given explicitly (e.g. to keep writing into an existing run's
     # folder); otherwise derive from --name or auto-generate as before.
@@ -119,6 +120,7 @@ def main(
         "use_video_data": use_video_data,
         "use_ortho_data": use_ortho_data,
         "ortho_stitch_radius": ortho_stitch_radius,
+        "ortho_label": ortho_label,
         "fresh_finetune": fresh_finetune,
     }
     if model == "detr":
