@@ -593,6 +593,7 @@ def evaluate(
     tile_server_token: str = None,
     ortho_stitch_radius: int = 1,
     flight_ids: str = None,
+    ortho_label: str = "fish",
 ):
     """
     Evaluates DETR model predictions on Sockeye validation task set.
@@ -625,6 +626,9 @@ def evaluate(
             used as-is, no split applied. This is how to fairly compare two checkpoints that
             were trained with different random splits: pick one fixed, explicit set of flights
             that neither model trained on, and pass it here for both evaluation runs.
+        ortho_label: Which annotation label to pull from /api/v1/ortho-tasks — 'fish'
+            (default, migration/swimming counts) or 'spawning_salmon'. Must match whatever
+            the checkpoint being evaluated was trained on.
     """
     # 1. Resolve arguments from model_info.json if provided
     if model_info:
@@ -721,7 +725,7 @@ def evaluate(
         ortho_tasks = []
         offset = 0
         while True:
-            url = f"{api_url}/ortho-tasks?limit={limit}&offset={offset}"
+            url = f"{api_url}/ortho-tasks?label={ortho_label}&limit={limit}&offset={offset}"
             res = requests.get(url, headers=headers)
             if res.status_code != 200:
                 raise RuntimeError(f"Failed to fetch ortho tasks: {res.status_code} - {res.text}")
@@ -731,7 +735,7 @@ def evaluate(
             ortho_tasks.extend(data)
             offset += limit
         ortho_tasks = [t for t in ortho_tasks if len(t.get("points", [])) > 0]
-        print(f"Loaded {len(ortho_tasks)} ortho tasks with annotations.", flush=True)
+        print(f"Loaded {len(ortho_tasks)} ortho tasks (label={ortho_label}) with annotations.", flush=True)
         tasks.extend(ortho_tasks)
 
     if flight_ids:
@@ -746,21 +750,34 @@ def evaluate(
         )
     else:
         # Reproduce the flight-aware validation split from train_detr_api.py (seed=42) —
-        # groups by flightId so a flight's data can't be split across train/val.
+        # groups by flightId so a flight's data can't be split across train/val. Falls
+        # back to a task-level split when there's only one flight in the pool (mirrors
+        # the same fallback in train_detr_api.py, e.g. for a single-ortho spawning-salmon
+        # run), since flight-grouping degenerates to an empty val set otherwise.
         random.seed(42)
         tasks_by_flight: Dict[str, list] = {}
         for t in tasks:
             fid = t.get("flightId") or f"__no_flight__{id(t)}"
             tasks_by_flight.setdefault(fid, []).append(t)
         flight_id_list = list(tasks_by_flight.keys())
-        random.shuffle(flight_id_list)
-        split_idx = max(1, int(len(flight_id_list) * 0.9))
-        val_flight_ids = flight_id_list[split_idx:]
-        val_tasks = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
-        print(
-            f"Evaluating on the flight-aware validation split: {len(val_flight_ids)} flights, "
-            f"{len(val_tasks)} tasks.", flush=True
-        )
+        if len(flight_id_list) > 1:
+            random.shuffle(flight_id_list)
+            split_idx = max(1, int(len(flight_id_list) * 0.9))
+            val_flight_ids = flight_id_list[split_idx:]
+            val_tasks = [t for fid in val_flight_ids for t in tasks_by_flight[fid]]
+            print(
+                f"Evaluating on the flight-aware validation split: {len(val_flight_ids)} flights, "
+                f"{len(val_tasks)} tasks.", flush=True
+            )
+        else:
+            shuffled = list(tasks)
+            random.shuffle(shuffled)
+            split_idx = max(1, int(len(shuffled) * 0.9))
+            val_tasks = shuffled[split_idx:]
+            print(
+                f"Only 1 flight in pool — evaluating on the task-level val split: "
+                f"{len(val_tasks)} tasks.", flush=True
+            )
 
     # 5. Initialize Model
     print("Building DETR model...", flush=True)
