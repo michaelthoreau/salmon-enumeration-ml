@@ -34,6 +34,8 @@ image = (
         "opencv-python-headless",
         "fastapi",
         "av",
+        "piexif",
+        "cameratransform",
     )
     .add_local_dir(
         ".",
@@ -66,6 +68,12 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 DEFAULT_CHECKPOINT = "/root/salmon-ml/models/best.pth"
+
+# Placeholder until a spawning-salmon-specific checkpoint has been trained — falls
+# back to the swimming-fish model so the raw-photo pipeline is fully runnable and
+# testable end-to-end today. Swap by setting SPAWNING_MODEL_CHECKPOINT (a plain path
+# under /root/salmon-ml/runs, or an mlflow-artifacts:/runs:/ URI) once training is done.
+SPAWNING_DEFAULT_CHECKPOINT = os.environ.get("SPAWNING_MODEL_CHECKPOINT", DEFAULT_CHECKPOINT)
 
 # ---------------------------------------------------------------------------
 # Helper functions for Model Configuration and Loading
@@ -395,6 +403,23 @@ def download_frame_from_sockeye(api_url: str, api_key: str, file_id: str, frame_
             
     raise RuntimeError(f"Failed to download frame {frame_num} for file {file_id} from Sockeye API after 3 attempts. Last error: {last_error_info}")
 
+
+def _download_bytes(url: str) -> bytes:
+    """Download raw bytes from a presigned URL (or any plain HTTP URL), with retries."""
+    import requests
+    last_error_info = "No attempts made"
+    for attempt in range(3):
+        try:
+            res = requests.get(url, timeout=30)
+            if res.status_code == 200:
+                return res.content
+            last_error_info = f"HTTP status {res.status_code}: {res.text[:120]}"
+            time.sleep(1.0 if res.status_code == 429 else 0.5)
+        except Exception as e:
+            last_error_info = f"Request Exception: {str(e)}"
+            time.sleep(1.0)
+    raise RuntimeError(f"Failed to download {url} after 3 attempts. Last error: {last_error_info}")
+
 # ---------------------------------------------------------------------------
 # Tiling Helper Functions
 # ---------------------------------------------------------------------------
@@ -459,6 +484,172 @@ def _pixel_to_latlon(col: float, row: float, z: int, x_min: int, y_min: int, til
     lng = tx / n * 360.0 - 180.0
     lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n))))
     return lng, lat
+
+# ---------------------------------------------------------------------------
+# DJI EXIF/XMP metadata + camera-pose ground projection
+#
+# Ported from salmon-enumeration-dashboard/modal/georef_worker.py's
+# _parse_dji_metadata / _compute_footprint, trimmed to just what's needed to
+# project a single detected pixel (not all 4 image corners) to a lat/lon on
+# the ground plane. Duplicated rather than shared since the two repos don't
+# share a package — keep in sync manually if the georef math changes.
+# ---------------------------------------------------------------------------
+
+def _rational_to_float(r) -> float:
+    try:
+        return float(r[0]) / float(r[1])
+    except Exception:
+        return 0.0
+
+def _gps_to_decimal(dms, ref: str) -> float:
+    deg, minute, sec = [_rational_to_float(v) for v in dms]
+    val = deg + minute / 60.0 + sec / 3600.0
+    return -val if ref in ("S", "W") else val
+
+def _extract_xmp(data: bytes):
+    start = data.find(b"<x:xmpmeta")
+    end = data.find(b"</x:xmpmeta>")
+    if start < 0 or end < 0:
+        return None
+    return data[start: end + len(b"</x:xmpmeta>")]
+
+def _dji_xmp(xmp_bytes: bytes) -> dict:
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xmp_bytes)
+    except Exception:
+        return {}
+    flat = {}
+    for el in root.iter():
+        for k, v in el.attrib.items():
+            flat[k.split("}")[-1]] = v
+    return flat
+
+def _parse_dji_metadata(jpeg_bytes: bytes) -> dict:
+    """Extract GPS + gimbal pose + camera intrinsics from a DJI JPEG's EXIF/XMP."""
+    import piexif
+    result = {}
+    try:
+        exif = piexif.load(jpeg_bytes)
+        gps = exif.get("GPS", {})
+        if gps:
+            lat_dms = gps.get(piexif.GPSIFD.GPSLatitude)
+            lat_ref = gps.get(piexif.GPSIFD.GPSLatitudeRef, b"N").decode()
+            lon_dms = gps.get(piexif.GPSIFD.GPSLongitude)
+            lon_ref = gps.get(piexif.GPSIFD.GPSLongitudeRef, b"E").decode()
+            if lat_dms:
+                result["lat"] = _gps_to_decimal(lat_dms, lat_ref)
+            if lon_dms:
+                result["lon"] = _gps_to_decimal(lon_dms, lon_ref)
+        exif_sub = exif.get("Exif", {})
+        focal_val = exif_sub.get(piexif.ExifIFD.FocalLength) if exif_sub else None
+        if focal_val:
+            result["focal_length_mm"] = _rational_to_float(focal_val)
+        exif0 = exif.get("0th", {})
+        result["img_width"] = exif0.get(piexif.ImageIFD.ImageWidth)
+        result["img_height"] = exif0.get(piexif.ImageIFD.ImageLength)
+    except Exception as e:
+        print(f"[predict_raw_photos] EXIF parse failed: {e}")
+
+    if not result.get("img_width") or not result.get("img_height"):
+        try:
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            result["img_width"], result["img_height"] = img.size
+        except Exception:
+            pass
+
+    xmp_bytes = _extract_xmp(jpeg_bytes)
+    if xmp_bytes:
+        dji = _dji_xmp(xmp_bytes)
+
+        def _f(key):
+            v = dji.get(key)
+            if v is None:
+                return None
+            try:
+                return float(v.lstrip("+"))
+            except ValueError:
+                return None
+
+        result["alt_abs"] = _f("AbsoluteAltitude")
+        result["alt_rel"] = _f("RelativeAltitude")
+        result["gimbal_yaw"] = _f("GimbalYawDegree")
+        result["gimbal_pitch"] = _f("GimbalPitchDegree")
+        result["gimbal_roll"] = _f("GimbalRollDegree")
+        result["focal_px"] = _f("CalibratedFocalLength")
+        result["cx"] = _f("CalibratedOpticalCenterX")
+        result["cy"] = _f("CalibratedOpticalCenterY")
+
+    return result
+
+
+def _build_camera(meta: dict):
+    """Build a cameratransform.Camera positioned/oriented per this photo's metadata.
+    Raises ValueError if required fields are missing."""
+    import cameratransform as ct
+
+    required = ["lat", "lon", "gimbal_yaw", "gimbal_pitch", "gimbal_roll", "img_width", "img_height"]
+    missing = [k for k in required if meta.get(k) is None]
+    if missing:
+        raise ValueError(f"Missing required georeferencing metadata: {missing}")
+
+    agl = meta.get("alt_rel") or meta.get("alt_abs") or 50.0
+    width, height = int(meta["img_width"]), int(meta["img_height"])
+
+    focal_px = meta.get("focal_px")
+    if not focal_px:
+        # Fall back to standard EXIF FocalLength (mm) — approximate px conversion
+        # assuming a typical DJI sensor (35mm-equivalent isn't exact, but this
+        # branch is only a fallback for non-calibrated images).
+        focal_mm = meta.get("focal_length_mm") or 10.26
+        sensor_width_mm = 13.2  # 1" sensor, matches the Hasselblad L1D-20c on Mavic 2 Pro
+        focal_px = focal_mm / sensor_width_mm * width
+
+    proj = ct.RectilinearProjection(focallength_px=focal_px, image=(width, height))
+    if meta.get("cx") is not None:
+        proj.center_x_px = meta["cx"]
+    if meta.get("cy") is not None:
+        proj.center_y_px = meta["cy"]
+
+    orientation = ct.SpatialOrientation(
+        elevation_m=agl,
+        tilt_deg=meta["gimbal_pitch"] + 90.0,
+        roll_deg=-meta["gimbal_roll"],
+        heading_deg=meta["gimbal_yaw"],
+    )
+    cam = ct.Camera(proj, orientation)
+    cam.setGPSpos(meta["lat"], meta["lon"], agl)
+    return cam
+
+
+def _project_point_to_gps(cam, x: float, y: float) -> tuple[float, float]:
+    """Project a single image pixel (x, y) onto the ground plane (Z=0) -> (lat, lon)."""
+    res = cam.gpsFromImage((x, y), Z=0)
+    return float(res[0]), float(res[1])
+
+
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _dedup_points(points: list, radius_m: float) -> list:
+    """Greedily merge detections that likely represent the same stationary fish seen
+    across multiple overlapping photos: process highest-confidence first, drop any
+    point within radius_m of an already-kept point. Consumer-GPS accuracy on this
+    drone (no RTK) is roughly ±1-3m, so radius_m should stay in that range — tight
+    enough to not merge distinct neighboring fish, loose enough to catch the same
+    fish reappearing across overlapping frames."""
+    ordered = sorted(points, key=lambda p: p["score"], reverse=True)
+    kept = []
+    for p in ordered:
+        if not any(_haversine_m(p["lat"], p["lng"], k["lat"], k["lng"]) <= radius_m for k in kept):
+            kept.append(p)
+    return kept
 
 # ---------------------------------------------------------------------------
 # Modal Class-based Web Server
@@ -887,6 +1078,83 @@ class SalmonInferenceServer:
                     "tiles_fetched": len(tile_images),
                     "checkpoint_used": checkpoint_path,
                 },
+            }
+
+        @web_app.post("/predict_raw_photos")
+        def predict_raw_photos(data: dict):
+            """Runs detection across a flight's raw source photos (not an orthomosaic),
+            projects each detection to real-world lat/lon using that photo's GPS + gimbal
+            pose, and dedupes detections of the same stationary subject seen across
+            multiple overlapping photos. Built for the spawning-salmon flow, where
+            ortho-stitching distortion was hurting detection quality — see photos: each
+            entry needs a presigned GET url so this service doesn't need its own S3 creds.
+            """
+            photos = data.get("photos")  # [{"url": presigned_get_url, "filename": "DJI_0001.JPG"}, ...]
+            score_thresh = float(data.get("score_thresh", 0.25))
+            iou_thresh = float(data.get("iou_thresh", 0.5))
+            dedup_radius_m = float(data.get("dedup_radius_m", 1.5))
+            checkpoint_req = data.get("checkpoint_path")
+
+            if not photos or not isinstance(photos, list):
+                raise HTTPException(status_code=400, detail="Missing photos: [{url, filename}, ...]")
+
+            checkpoint_path = resolve_checkpoint(checkpoint_req or SPAWNING_DEFAULT_CHECKPOINT)
+            model, model_type, num_context_frames, _ = self.get_model(checkpoint_path)
+
+            def process_one(photo):
+                url = photo.get("url")
+                filename = photo.get("filename", url)
+                try:
+                    raw = _download_bytes(url)
+                    meta = _parse_dji_metadata(raw)
+                    cam = _build_camera(meta)
+                    pil_img = Image.open(io.BytesIO(raw)).convert("RGB")
+                except Exception as e:
+                    print(f"[predict_raw_photos] skipping {filename}: {e}")
+                    return filename, [], str(e)
+
+                pixel_points = self._infer_image(
+                    pil_img, model, model_type, num_context_frames=0,
+                    score_thresh=score_thresh, iou_thresh=iou_thresh,
+                )
+                geo_points = []
+                for p in pixel_points:
+                    try:
+                        lat, lng = _project_point_to_gps(cam, p["x"], p["y"])
+                        geo_points.append({"lat": round(lat, 8), "lng": round(lng, 8),
+                                            "score": p["score"], "source_photo": filename})
+                    except Exception as e:
+                        print(f"[predict_raw_photos] projection failed for a point in {filename}: {e}")
+                return filename, geo_points, None
+
+            all_geo_points = []
+            errors = []
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for filename, geo_points, err in ex.map(process_one, photos):
+                    all_geo_points.extend(geo_points)
+                    if err:
+                        errors.append({"filename": filename, "error": err})
+
+            print(f"[predict_raw_photos] {len(all_geo_points)} raw detections across "
+                  f"{len(photos)} photos ({len(errors)} failed) before dedup")
+
+            deduped = _dedup_points(all_geo_points, dedup_radius_m)
+
+            print(f"[predict_raw_photos] {len(deduped)} detections after dedup "
+                  f"(radius={dedup_radius_m}m)")
+
+            return {
+                "points": deduped,
+                "count": len(deduped),
+                "model_parameters": {
+                    "model_type": model_type,
+                    "photos_processed": len(photos),
+                    "photos_failed": len(errors),
+                    "raw_detection_count": len(all_geo_points),
+                    "dedup_radius_m": dedup_radius_m,
+                    "checkpoint_used": checkpoint_path,
+                },
+                "errors": errors,
             }
 
         return web_app
