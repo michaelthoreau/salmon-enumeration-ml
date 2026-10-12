@@ -91,12 +91,23 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
         num_queries=config_dict.get('num_queries', num_queries),
     )
     model = DetrForObjectDetection(config)
-    if companion_mode:
-        _expand_first_conv_6ch(model)
-        
+    
+    state_dict = ckpt['state_dict']
+
+    # Auto-detect input channels from checkpoint conv1 weight shape
+    in_channels = 3
+    for k, v in state_dict.items():
+        if "conv1.weight" in k and hasattr(v, "shape") and len(v.shape) == 4:
+            in_channels = v.shape[1]
+            break
+
+    if in_channels != 3:
+        _expand_first_conv_6ch(model, in_channels=in_channels)
+    elif companion_mode:
+        _expand_first_conv_6ch(model, in_channels=6)
+
     # Map state dict keys dynamically to handle transformers version mismatches (e.g. model.backbone.model vs model.backbone.conv_encoder.model, self_attn.o_proj vs self_attn.out_proj, etc.)
     model_keys = set(model.state_dict().keys())
-    state_dict = ckpt['state_dict']
     new_state_dict = {}
     for k, v in state_dict.items():
         if k not in model_keys:
@@ -162,22 +173,35 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
 _normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
 
-def _tile_tensor(crop: Image.Image, companion_crop: Image.Image | None) -> torch.Tensor:
+def _get_model_in_channels(model) -> int:
+    import torch.nn as nn
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            return module.in_channels
+    return 3
+
+
+def _tile_tensor(crop: Image.Image, companion_crop: Image.Image | None, target_channels: int = 3) -> torch.Tensor:
     t = _normalize(T.functional.to_tensor(crop))
     if companion_crop is not None:
         c = _normalize(T.functional.to_tensor(companion_crop))
         t = torch.cat([t, c], dim=0)
+
+    if t.shape[0] < target_channels:
+        repeats = (target_channels + t.shape[0] - 1) // t.shape[0]
+        t = t.repeat(repeats, 1, 1)[:target_channels, :, :]
     return t
 
 
-def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | None):
-    """Non-overlapping tiles; last tile slides back at edges."""
+def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | None, target_channels: int = 3, tile_overlap: int = 128):
+    """Sliding tiles with overlap to prevent boundary clipping; last tile slides back at edges."""
     W, H = pil.size
+    stride = max(S - tile_overlap, 64) if tile_overlap > 0 else S
 
     def origins(dim):
         if dim <= S:
             return [0]
-        os_ = list(range(0, dim - S + 1, S))
+        os_ = list(range(0, dim - S + 1, stride))
         if os_[-1] + S < dim:
             os_.append(dim - S)
         return sorted(set(os_))
@@ -185,14 +209,14 @@ def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | None):
     if W < S or H < S:
         pil_r  = pil.resize((S, S), Image.BILINEAR)
         comp_r = companion_pil.resize((S, S), Image.BILINEAR) if companion_pil else None
-        return [(_tile_tensor(pil_r, comp_r), 0, 0)]
+        return [(_tile_tensor(pil_r, comp_r, target_channels=target_channels), 0, 0)]
 
     tiles = []
     for y0 in origins(H):
         for x0 in origins(W):
             crop = pil.crop((x0, y0, x0 + S, y0 + S))
             comp = companion_pil.crop((x0, y0, x0 + S, y0 + S)) if companion_pil else None
-            tiles.append((_tile_tensor(crop, comp), x0, y0))
+            tiles.append((_tile_tensor(crop, comp, target_channels=target_channels), x0, y0))
     return tiles
 
 
@@ -219,6 +243,8 @@ def _infer_batch(
     iou_thresh: float,
     tile_batch_size: int = 16,
     box_size: int = 50,
+    min_dist: float = 45.0,
+    tile_overlap: int = 128
 ) -> list[list[tuple[int, int, float, float, float, float, float]]]:
     """
     Infer on multiple frames.  Tiles are collected across all frames and sent
@@ -227,6 +253,7 @@ def _infer_batch(
     """
     n_frames = len(frames)
     S        = img_size
+    target_channels = _get_model_in_channels(model)
 
     # 1. Build the full tile list (CPU side — cheap)
     all_tile_info: list[tuple[torch.Tensor, int, int, int]] = []
@@ -234,7 +261,7 @@ def _infer_batch(
         pil      = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         comp_pil = (Image.fromarray(cv2.cvtColor(companion_bgr, cv2.COLOR_BGR2RGB))
                     if companion_bgr is not None else None)
-        for tile_t, tx, ty in _make_tiles(pil, S, comp_pil):
+        for tile_t, tx, ty in _make_tiles(pil, S, comp_pil, target_channels=target_channels, tile_overlap=tile_overlap):
             all_tile_info.append((tile_t, tx, ty, fi))
 
     # 2. Forward pass in GPU sub-batches
@@ -262,7 +289,7 @@ def _infer_batch(
                 frame_boxes[fi].append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
                 frame_scores[fi].append(s)
 
-    # 3. Per-frame NMS
+    # 3. Per-frame NMS (IoU NMS + Point Distance NMS)
     results = []
     for fi in range(n_frames):
         if frame_boxes[fi]:
@@ -276,6 +303,22 @@ def _infer_batch(
                 cx = int((x1 + x2) / 2)
                 cy = int((y1 + y2) / 2)
                 frame_res.append((cx, cy, x1, y1, x2, y2, score))
+
+            if min_dist > 0:
+                frame_res = sorted(frame_res, key=lambda r: r[6], reverse=True)
+                dist_kept = []
+                for r in frame_res:
+                    cx, cy = r[0], r[1]
+                    too_close = False
+                    for k in dist_kept:
+                        kx, ky = k[0], k[1]
+                        if math.hypot(cx - kx, cy - ky) < min_dist:
+                            too_close = True
+                            break
+                    if not too_close:
+                        dist_kept.append(r)
+                frame_res = dist_kept
+
             results.append(frame_res)
         else:
             results.append([])
@@ -365,19 +408,46 @@ def _draw_motion_panel(frame: np.ndarray, mean_speed: float, num_tracks: int, me
     return frame
 
 
+def _draw_line_panel(frame: np.ndarray, count_up: int, count_down: int, margin: int = 20) -> np.ndarray:
+    """Overlay a line-crossing stats panel in the top-right corner."""
+    H, W = frame.shape[:2]
+    pw, ph = 260, 115
+    px = W - pw - margin
+    py = margin
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (20, 20, 20), -1)
+
+    accent_color = (0, 235, 255)  # Cyan accent
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), accent_color, 2)
+
+    frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+    net = count_up - count_down
+    cv2.putText(frame, "LINE CROSSINGS", (px + 16, py + 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"Down (v): {count_down}", (px + 16, py + 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 215, 90), 2, cv2.LINE_AA)
+
+    cv2.putText(frame, f"Up (^)  : {count_up}", (px + 16, py + 76),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (80, 200, 255), 2, cv2.LINE_AA)
+
+    cv2.putText(frame, f"Net     : {net:+d}", (px + 16, py + 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return frame
+
+
 def _draw_count_graph(
     frame: np.ndarray,
     count_history: deque,
     ma_window: int,
-    hourly_rate: float | None = None,
-    traverse_seconds: float   = 25.0,
     graph_h: int = 110,
     graph_w: int = 380,
     margin: int  = 14,
+    fps: float   = 30.0,
 ) -> np.ndarray:
-    """Overlay a count graph (raw + moving average) in the bottom-right corner.
-    Right y-axis shows equivalent hourly escapement values.
-    """
     """Overlay a count graph (raw + moving average) in the bottom-right corner."""
     H, W = frame.shape[:2]
     counts = list(count_history)
@@ -424,25 +494,11 @@ def _draw_count_graph(
     cv2.putText(frame, '0', (px - 4, py + graph_h + 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (100, 100, 100), 1, cv2.LINE_AA)
 
-    # Right y-axis: hourly escapement values
-    esc_per_count = 3600.0 / max(traverse_seconds, 1e-6)
-    esc_max = int(max_c * esc_per_count)
-    rx = px + graph_w + 3
-    cv2.putText(frame, f'{esc_max:,}/hr', (rx, py + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 200, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, '0/hr', (rx, py + graph_h + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 200, 255), 1, cv2.LINE_AA)
-
-    # Current count + MA text
-    label = f'Count: {counts[-1]}   MA-{ma_window}: {ma[-1]:.1f}'
+    # Current count + MA text with seconds calculation
+    ma_sec = max(round(ma_window / max(fps, 1e-3)), 1)
+    label = f'Count: {counts[-1]}   {ma_sec}s Avg: {ma[-1]:.1f}'
     cv2.putText(frame, label, (px, py - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 215, 90), 2, cv2.LINE_AA)
-
-    # Hourly escapement
-    if hourly_rate is not None:
-        esc_label = f'Escapement: {hourly_rate:,.0f} fish/hr'
-        cv2.putText(frame, esc_label, (px, py - 38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (80, 200, 255), 2, cv2.LINE_AA)
 
     return frame
 
@@ -468,7 +524,9 @@ class Pipeline:
         tile_batch_size: int = 16,
         infer_every: int = 1,
         detect_height: int | None = None,
-        box_size: int = 50
+        box_size: int = 50,
+        min_dist: float = 45.0,
+        tile_overlap: int = 128
     ) -> dict:
         """
         Stage 1: GPU-bound inference. Processes video from start_sec to start_sec+duration_sec,
@@ -479,7 +537,7 @@ class Pipeline:
         # ---- load model ----
         print(f'Loading checkpoint: {checkpoint}')
         model = load_model(checkpoint, num_queries, companion_mode)
-        print(f'Model loaded  |  companion_mode={companion_mode}  |  img_size={img_size}')
+        print(f'Model loaded  |  companion_mode={companion_mode}  |  img_size={img_size}  |  min_dist={min_dist}px  |  tile_overlap={tile_overlap}px')
 
         # ---- open video ----
         cap = cv2.VideoCapture(str(video_path))
@@ -548,10 +606,13 @@ class Pipeline:
                 else:
                     frames_to_infer.append((f, c))
 
+            eff_min_dist = (min_dist * scale) if scale is not None else min_dist
             batch_results = (_infer_batch(model, frames_to_infer,
                                           img_size, score_thresh, iou_thresh,
                                           tile_batch_size=tile_batch_size,
-                                          box_size=box_size)
+                                          box_size=box_size,
+                                          min_dist=eff_min_dist,
+                                          tile_overlap=tile_overlap)
                               if infer_in_block else [])
             infer_by_pos = {pos: res for (_, _, pos), res in zip(infer_in_block, batch_results)}
 
@@ -633,7 +694,8 @@ class Pipeline:
         output_track_json: str | None = None,
         track_thresh: float = 0.35,
         min_box_score: float = 0.1,
-        ma_window: int = 30
+        ma_window: int = 30,
+        line_position: float | None = 0.5
     ) -> dict:
         """
         Stage 2: CPU-bound tracking. Loads and merges bounding boxes from one or more
@@ -687,12 +749,23 @@ class Pipeline:
         metrics_counts = {}
         metrics_speeds = {}
         metrics_directions = {}
+        metrics_line_counts = {}
+
+        # Horizontal counting line position setup
+        if line_position is not None:
+            y_line = int(line_position * height) if 0.0 <= line_position <= 1.0 else int(line_position)
+        else:
+            y_line = int(0.5 * height)
+
+        track_last_side: dict[int, int] = {}  # track_id -> -1 (above) or 1 (below)
+        count_down = 0
+        count_up = 0
         
         count_history = deque(maxlen=max(ma_window * 3, 90))
         last_mean_speed = 0.0
         last_mean_vector = None
 
-        print(f"Tracking over {len(sorted_frame_indices)} frames...")
+        print(f"Tracking over {len(sorted_frame_indices)} frames (Counting line Y={y_line})...")
         
         for frame_idx in tqdm(sorted_frame_indices, desc="Tracking", unit="frame", ncols=100):
             detections = merged_detections[frame_idx]
@@ -704,6 +777,20 @@ class Pipeline:
             for track in active_tracks:
                 cx = int((track.tlbr[0] + track.tlbr[2]) / 2)
                 cy = int((track.tlbr[1] + track.tlbr[3]) / 2)
+
+                # Line crossing logic
+                side = -1 if cy < y_line else (1 if cy > y_line else 0)
+                if track.track_id in track_last_side:
+                    prev_side = track_last_side[track.track_id]
+                    if prev_side == -1 and side == 1:
+                        count_down += 1
+                        track_last_side[track.track_id] = 1
+                    elif prev_side == 1 and side == -1:
+                        count_up += 1
+                        track_last_side[track.track_id] = -1
+                else:
+                    if side != 0:
+                        track_last_side[track.track_id] = side
 
                 mv_res = get_motion_vector(track, frame_idx, fps)
                 if mv_res is not None:
@@ -737,6 +824,12 @@ class Pipeline:
             metrics_counts[frame_idx] = len(frame_centroids)
             metrics_speeds[frame_idx] = round(last_mean_speed, 2)
             metrics_directions[frame_idx] = [round(float(v), 3) for v in last_mean_vector] if last_mean_vector is not None else None
+            metrics_line_counts[frame_idx] = {
+                "up": count_up,
+                "down": count_down,
+                "net": count_down - count_up,
+                "line_y": y_line
+            }
             count_history.append(len(frame_centroids))
 
         out_data = {
@@ -748,7 +841,8 @@ class Pipeline:
             "metrics": {
                 "frame_counts": metrics_counts,
                 "frame_speeds": metrics_speeds,
-                "frame_directions": metrics_directions
+                "frame_directions": metrics_directions,
+                "line_counts": metrics_line_counts
             }
         }
 
@@ -843,6 +937,7 @@ class Pipeline:
         frame_counts = metrics.get("frame_counts", {})
         frame_speeds = metrics.get("frame_speeds", {})
         frame_directions = metrics.get("frame_directions", {})
+        line_counts = metrics.get("line_counts", {})
 
         pbar = tqdm(total=len(sorted_keys), desc='Rendering', unit='frame', ncols=100)
         
@@ -863,13 +958,14 @@ class Pipeline:
             if scale != 1.0:
                 frame_bgr = cv2.resize(frame_bgr, (w_out, h_out))
 
-            f_key = str(frame_idx)
-            last_centroids = tracks_dict[f_key]
-            last_mean_speed = frame_speeds.get(f_key, 0.0)
-            raw_dir = frame_directions.get(f_key, None)
+            f_str = str(frame_idx)
+            f_int = int(frame_idx)
+            last_centroids = tracks_dict.get(f_str, tracks_dict.get(f_int, []))
+            last_mean_speed = frame_speeds.get(f_str, frame_speeds.get(f_int, 0.0))
+            raw_dir = frame_directions.get(f_str, frame_directions.get(f_int, None))
             last_mean_vector = np.array(raw_dir) if raw_dir is not None else None
             
-            last_count = frame_counts.get(f_key, 0)
+            last_count = frame_counts.get(f_str, frame_counts.get(f_int, 0))
             count_history.append(last_count)
 
             # Apply scale to centroids
@@ -895,11 +991,23 @@ class Pipeline:
             out_frame = _draw_centroids(frame_bgr, scaled_centroids, radius=dot_radius)
             out_frame = _draw_count_graph(
                 out_frame, count_history, ma_window,
-                hourly_rate=ma_val * (3600 / traverse_seconds),
-                traverse_seconds=traverse_seconds,
                 graph_h=graph_height, graph_w=graph_width,
+                fps=fps_out
             )
             out_frame = _draw_motion_panel(out_frame, mean_speed_val, len(scaled_centroids), mean_vector_val)
+
+            # Line crossing overlay
+            line_info = line_counts.get(f_str, line_counts.get(f_int, None))
+            if line_info is not None:
+                up_cnt = line_info.get("up", 0)
+                down_cnt = line_info.get("down", 0)
+                y_line = line_info.get("y_line", int(0.5 * h_vid))
+                y_line_scaled = int(y_line * scale)
+                cv2.line(out_frame, (0, y_line_scaled), (w_out, y_line_scaled), (0, 235, 255), 2, cv2.LINE_AA)
+                cv2.putText(out_frame, f"COUNTING LINE (Y={y_line})", (20, max(y_line_scaled - 8, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 235, 255), 1, cv2.LINE_AA)
+                out_frame = _draw_line_panel(out_frame, up_cnt, down_cnt)
+
             writer.write(out_frame)
             pbar.update(1)
 
@@ -933,7 +1041,10 @@ class Pipeline:
         track_thresh: float = 0.35,
         min_box_score: float = 0.1,
         detect_height: int | None = None,
-        render_height: int | None = 1080
+        render_height: int | None = 1080,
+        line_position: float | None = 0.5,
+        min_dist: float = 45.0,
+        tile_overlap: int = 128
     ):
         """
         Run the entire pipeline (Detect -> Track -> Render) sequentially in memory.
@@ -945,14 +1056,15 @@ class Pipeline:
             score_thresh=score_thresh, iou_thresh=iou_thresh, num_queries=num_queries,
             companion_mode=companion_mode, batch_frames=batch_frames,
             tile_batch_size=tile_batch_size, infer_every=infer_every,
-            detect_height=detect_height
+            detect_height=detect_height, min_dist=min_dist, tile_overlap=tile_overlap
         )
 
         print("\n=== STAGE 2: TRACKING ===")
         t_thresh = track_thresh if track_thresh is not None else score_thresh
         track_data = self.track(
             detection_jsons=detection_data, output_track_json=None,
-            track_thresh=t_thresh, min_box_score=min_box_score, ma_window=ma_window
+            track_thresh=t_thresh, min_box_score=min_box_score, ma_window=ma_window,
+            line_position=line_position
         )
 
         print("\n=== STAGE 3: RENDERING ===")
