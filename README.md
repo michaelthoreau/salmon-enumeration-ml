@@ -1,6 +1,6 @@
 # Salmon Enumeration ML
 
-Salmon counting from aerial/underwater imagery using [IOCFormer](https://openaccess.thecvf.com/content/CVPR2023/papers/Sun_Indiscernible_Object_Counting_in_Underwater_Scenes_CVPR_2023_paper.pdf) (Conditional DETR + density-map branch), adapted to work with JSON point annotations.
+Salmon counting from aerial/underwater imagery using DETR, adapted to work with JSON point annotations. DETR is the only maintained model architecture; older model implementations and all Modal integrations are archived in [deprecated/](deprecated/README.md).
 
 ---
 
@@ -65,16 +65,16 @@ python train_detr_api.py --resume=runs/exp_detr_cf2_cs10_lr0.0001/best.pth
 
 ---
 
-### 2. Local File Training (Legacy)
+### 2. Local File Training (DETR)
 
-To train on local JPEGs and JSON annotation files in the `data/` folder, run `train.py`:
+To train on local JPEGs and JSON annotation files in the `data/` folder, run `train_detr.py`:
 
 ```bash
 # Default run (auto-names runs/exp0, exp1, …)
-python train.py
+python train_detr.py
 
 # Common overrides
-python -u train.py \
+python -u train_detr.py \
   --data_root=data/ \
   --epochs=1500 \
   --batch_size=8 \
@@ -99,10 +99,10 @@ Logs and TensorBoard events are written to the run directory.
 tensorboard --logdir runs/
 ```
 
-### Shared MLflow tracking (local + Modal)
+### Shared MLflow tracking
 
 Training scripts (`train_detr_api.py`, etc.) also log params/metrics/artifacts to MLflow.
-To share one tracking server across local and Modal runs, host it locally and tunnel it with ngrok:
+To share one tracking server across machines, host it locally and tunnel it with ngrok:
 
 ```bash
 # .env
@@ -121,9 +121,8 @@ python train_detr_api.py --mlflow_tracking_uri=https://xxxx.ngrok-free.app ...
 export MLFLOW_TRACKING_URI=https://xxxx.ngrok-free.app
 ```
 
-For Modal training, just add `MLFLOW_TRACKING_URI=...` to `.env` — it's forwarded automatically as a
-Modal secret — or pass `--mlflow_tracking_uri=...` to `train_modal.py`. View runs at the same ngrok URL
-in a browser (it serves the MLflow UI too).
+View runs at the same ngrok URL in a browser (it serves the MLflow UI too).
+All Modal integrations are deprecated; use the local DETR training entry points above.
 
 ---
 
@@ -131,18 +130,16 @@ in a browser (it serves the MLflow UI too).
 
 | Path | Description |
 |---|---|
-| `annotate.py` | Annotation viewer/editor + inference UI (Flask) |
-| `train.py` | Single-GPU training entry point |
-| `train_distributed.py` | Multi-GPU distributed training (legacy) |
-| `dataset.py` | Dataset / DataLoader - JSON annotations to tensors |
-| `image.py` | load_data: reads JPEG + JSON annotation into kpoint map |
-| `ot_loss.py` | Optimal-transport loss |
-| `bregman_pytorch.py` | Sinkhorn/Bregman solver used by OT loss |
-| `utils.py` | Logging and checkpointing helpers |
-| `test.py` | Standalone evaluation script |
-| `video_demo.py` | Video inference demo |
-| `Networks/CDETR/` | Conditional DETR model (backbone, transformer, matcher) |
-| `util/` | box_ops.py, misc.py |
+| `train_detr_api.py` | DETR training from Sockeye API annotations |
+| `train_detr.py` | DETR training from local JPEGs and JSON annotations |
+| `dataset_api.py` | Shared API dataset and frame caching |
+| `eval_detr_api.py` | DETR evaluation |
+| `infer_video_detr.py` | Tiled DETR video inference, tracking, and rendering |
+| `tracker.py` | Tracking and line-crossing enumeration |
+| `mlflow_server.py` | MLflow tracking server |
+| `debug_overlay.py` | Annotation debugging overlays |
+| `models/` | Saved DETR checkpoints and provenance metadata |
+| `deprecated/` | Archived CNN/IOCFormer code, legacy annotation server, helpers, and all Modal integrations |
 | `data/input/images/` | Images to run inference on |
 | `data/input/videos/` | Videos to run inference on |
 | `data/train/raw/images/` | Raw/unlabeled images queued for labelling |
@@ -157,121 +154,15 @@ in a browser (it serves the MLflow UI too).
 
 ---
 
-## Modal Cloud Training & Inference API
+## Deprecated Modal Integrations
 
-This repository supports running deep learning training and exposing inference endpoints on [Modal](https://modal.com) using cloud GPUs.
+Modal training, inference, evaluation, and the prediction API are preserved in
+[deprecated/](deprecated/README.md) for historical reference and are no longer maintained.
+The active workflows use local DETR training, `eval_detr_api.py`, and `infer_video_detr.py`.
 
-### 1. Training a Model on Modal
-
-To launch remote training in the cloud on a high-performance GPU (L4), use the `train_modal.py` entrypoint.
-
-#### Training DETR (Standard)
-```bash
-# Train DETR with 2 context frames and a stride of 10
-modal run train_modal.py --model detr --num-context-frames 2 --context-stride 10
-
-# Train DETR with no context frames (single image)
-modal run train_modal.py --model detr --num-context-frames 0
-
-# Train DETR with custom hyper-parameters and custom run name
-modal run train_modal.py \
-  --model detr \
-  --num-context-frames 1 \
-  --context-stride 5 \
-  --lr 1e-4 \
-  --batch-size 8 \
-  --epochs 1000 \
-  --name custom_detr_run
-```
-
-#### Training IOCFormer
-```bash
-# Train IOCFormer (CDETR + Density Map branch)
-modal run train_modal.py --model iocformer --num-context-frames 2 --context-stride 10
-```
-
-*Note: All checkpoints are automatically saved to the persistent Modal volume `salmon-runs-volume` under `runs/`.*
-
----
-
-### 2. Deploying / Updating the Prediction API
-
-The API endpoint loads the trained checkpoints from the persistent volume and runs inference on a T4 GPU.
-
-#### Deploy/Update Command:
-Whenever you modify `predict_modal.py` or want to publish your latest model updates, redeploy it using:
-```bash
-# Activating python environment and deploying
-conda activate salmon-ml
-modal deploy predict_modal.py
-```
-This updates the web server in place, returning a stable endpoint URL like:
-`https://<modal-workspace>-salmon-prediction-api-salmoninferenceser-xxxxxx.modal.run`
-
-#### Automatic Checkpoint and Parameter Detection:
-You don't need to manually configure the model architecture on deployment. The server automatically:
-- Distinguishes between **DETR** and **IOCFormer** checkpoints by inspecting weight keys.
-- Detects the number of **context frames** (via first conv weight shape) and **context stride** (via folder name regex, falling back to 10).
-- Dynamically loads and caches the selected checkpoint in GPU memory to support sub-second subsequent calls.
-
----
-
-### 3. Calling the API from the Web Frontend
-
-The API has built-in CORS headers allowing requests from `https://salmon.projectkiwi.io` and any `http://localhost:<port>` web applications.
-
-#### Endpoint Schema:
-- **URL:** `POST https://<your-modal-endpoint-url>/predict`
-- **Payload formats:**
-  - **Sockeye Task (Preferred & Light)**: Pass the `task` object directly. The server downloads only the required frame JPEGs directly from the Sockeye API, bypasses video seek overhead.
-  - **Video URL (Fallback)**: Pass a public or presigned video URL + frame index.
-
-#### Frontend JavaScript Fetch Example:
-You can paste this directly into your frontend code (React, Vue, or vanilla JS):
-
-```javascript
-async function fetchSalmonDetections(taskData) {
-  const modalEndpoint = "https://michaelthoreau--salmon-prediction-api-salmoninferenceser-6e48b3.modal.run/predict";
-
-  const payload = {
-    // 1. Pass the Sockeye task object containing fileId, frame, and crop bounds (x1, y1, x2, y2)
-    task: taskData, 
-    
-    // 2. Score confidence threshold (optional, defaults to 0.25)
-    score_thresh: 0.25,
-    
-    // 3. Checkpoint relative path (optional, defaults to the latest trained best.pth)
-    checkpoint_path: "exp_detr_cf1_cs10_lr0.0001/best.pth" 
-  };
-
-  try {
-    const response = await fetch(modalEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error(`API Error: ${response.status} - ${await response.text()}`);
-    }
-
-    const data = await response.json();
-    console.log("Detected points:", data.points);
-    console.log("Total Count:", data.count);
-    console.log("Model parameters used:", data.model_parameters);
-    
-    // Points contain:
-    // - x, y: absolute coordinates on the full video resolution
-    // - crop_x, crop_y: coordinates relative to task crop bounds
-    // - score: prediction confidence
-    return data.points;
-  } catch (error) {
-    console.error("Failed to fetch predictions:", error);
-  }
-}
-```
+Local API training and evaluation still accept `MODAL_TILE_SERVER_URL` and
+`MODAL_TILE_TOKEN` for backward compatibility with existing HTTP tile servers.
+These environment variables do not require the Modal SDK.
 
 ---
 

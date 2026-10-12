@@ -1,6 +1,6 @@
 """
 Host a local MLflow tracking server and expose it publicly via ngrok, so that
-training runs anywhere (this machine, Modal, etc.) can log to a single shared
+training runs on this machine or other machines can log to a single shared
 tracking server.
 
 Setup:
@@ -19,9 +19,8 @@ Then point any training run at the printed public URL:
     export MLFLOW_TRACKING_URI=<public_url>
     python train_detr_api.py ...
 
-For Modal training (train_modal.py), the tracking URI is forwarded automatically
-via .env (loaded as a Modal secret) — just add MLFLOW_TRACKING_URI=<public_url>
-to your .env before launching a remote run.
+All Modal integrations are archived in deprecated/ and are no longer maintained.
+Use the local DETR training entry points for new runs.
 """
 
 import os

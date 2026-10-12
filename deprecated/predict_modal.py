@@ -6,7 +6,6 @@ import math
 import time
 import urllib.parse
 import hashlib
-from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -139,7 +138,7 @@ def detect_context_stride(checkpoint_path: str):
     return 10  # default fallback
 
 def detect_model_type(state_dict):
-    """Differentiates between CNN, CDETR/IOCFormer, and standard DETR by checking keys."""
+    """Identify legacy checkpoints so the DETR-only API can reject them."""
     if any("up5" in k for k in state_dict.keys()) or any("fusion" in k for k in state_dict.keys()):
         return "cnn"
     if any("layers_density" in k for k in state_dict.keys()):
@@ -194,7 +193,7 @@ def resolve_checkpoint(checkpoint_req: str) -> str:
     return checkpoint_req
 
 def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda"):
-    """Loads DETR or IOCFormer dynamically based on the checkpoint structure."""
+    """Load a DETR checkpoint, rejecting deprecated model architectures."""
     print(f"Loading checkpoint: {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -210,60 +209,11 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "cuda"):
 
     print(f"Detected parameters: type={model_type}, context_frames={num_context_frames}, context_stride={context_stride}")
 
-    if model_type == "cnn":
-        from train_cnn_api import LightweightCNNWithLateFusion
-        model = LightweightCNNWithLateFusion(num_context_frames=num_context_frames)
-        model.load_state_dict(state_dict)
-    elif model_type == "iocformer":
-        from train_iocformer_api import build_model
-        
-        cfg = SimpleNamespace(
-            backbone='resnet50',
-            dilation=True,
-            lr_backbone=1e-5,
-            position_embedding='sine',
-            masks=False,
-            frozen_weights=None,
-            enc_layers=6,
-            dec_layers=6,
-            dim_feedforward=2048,
-            hidden_dim=256,
-            dropout=0.1,
-            nheads=8,
-            num_queries=100,
-            pre_norm=False,
-            transformer_flag='merge3',
-            dm_count=True,
-            branch_merge=True,
-            branch_merge_way=2,
-            channel_point=3,
-            only_dm=False,
-            with_weights=False,
-            aux_loss=True,
-            cls_loss_coef=2,
-            point_loss_coef=5,
-            giou_loss_coef=2,
-            mask_loss_coef=1,
-            dice_loss_coef=1,
-            set_cost_class=2,
-            set_cost_point=5,
-            set_cost_giou=2,
-            focal_alpha=0.25,
-            dataset_file='crowd_data',
-            device='cuda',
+    if model_type != "detr":
+        raise ValueError(
+            f"{model_type} checkpoints are deprecated. This API supports DETR only; "
+            "legacy implementations are archived in deprecated/."
         )
-        
-        # Override queries if saved in checkpoint
-        if 'query_embed.weight' in state_dict:
-            cfg.num_queries = state_dict['query_embed.weight'].shape[0]
-
-        model, _, _ = build_model(cfg)
-
-        if num_context_frames > 0:
-            from Networks.CDETR.backbone import expand_first_conv
-            expand_first_conv(model.backbone, in_channels=3 * (1 + num_context_frames))
-            
-        model.load_state_dict(state_dict)
     else:
         # Standard DETR
         from transformers import DetrConfig, DetrForObjectDetection
@@ -708,39 +658,8 @@ class SalmonInferenceServer:
                 pv = tile_t.unsqueeze(0).cuda()
                 pm = torch.ones(1, S, S, dtype=torch.long).cuda()
 
-                if model_type == "iocformer":
-                    out_all = model(pv)
-                    d6 = out_all[0] if isinstance(out_all, list) else out_all
-                    probs = d6['pred_logits'].sigmoid()[0, :, 1].cpu()
-                    pts = d6['pred_points'][0].cpu()
-                    keep = probs > score_thresh
-                    if keep.any():
-                        p_kept = pts[keep]; s_kept = probs[keep]
-                        if orig_W < S or orig_H < S:
-                            cx = p_kept[:, 0] * orig_W; cy = p_kept[:, 1] * orig_H
-                            w = torch.full_like(cx, box_size * (orig_W / S)); h = torch.full_like(cy, box_size * (orig_H / S))
-                        else:
-                            cx = tx + p_kept[:, 0] * S; cy = ty + p_kept[:, 1] * S
-                            w = torch.full_like(cx, box_size); h = torch.full_like(cy, box_size)
-                        all_boxes_xyxy.append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
-                        all_scores.append(s_kept)
-
-                elif model_type == "cnn":
-                    from train_cnn_api import extract_peaks
-                    out_heatmap = model(pv).cpu()[0]
-                    peaks = extract_peaks(out_heatmap.unsqueeze(0), threshold=score_thresh)[0]
-                    if peaks:
-                        pts = torch.tensor([[p[0], p[1]] for p in peaks], dtype=torch.float)
-                        s_kept = torch.tensor([p[2] for p in peaks], dtype=torch.float)
-                        if orig_W < S or orig_H < S:
-                            cx = pts[:, 0] * (orig_W / S); cy = pts[:, 1] * (orig_H / S)
-                            w = torch.full_like(cx, box_size * (orig_W / S)); h = torch.full_like(cy, box_size * (orig_H / S))
-                        else:
-                            cx = tx + pts[:, 0]; cy = ty + pts[:, 1]
-                            w = torch.full_like(cx, box_size); h = torch.full_like(cy, box_size)
-                        all_boxes_xyxy.append(torch.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], 1))
-                        all_scores.append(s_kept)
-
+                if model_type != "detr":
+                    raise ValueError("Only DETR models are supported for inference.")
                 else:  # detr
                     out = model(pixel_values=pv, pixel_mask=pm)
                     probs = out.logits.cpu()[0].softmax(-1)[:, 0]
