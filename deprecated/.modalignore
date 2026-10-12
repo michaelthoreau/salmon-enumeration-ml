@@ -1,0 +1,38 @@
+# Ignore local virtual environment
+.venv/
+.venv
+
+# Ignore IDE config & logs
+.gemini/
+.gemini
+.vscode/
+
+# Ignore local checkpoint runs and data
+runs/
+runs
+data/
+data
+data_big/
+data_big
+debug/
+
+# Ignore Git directory
+.git/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore dependencies
+node_modules/
+
+# Ignore heavy media, assets, and models
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.png
+*.zip
+*.tar.gz
+*.pth
