@@ -1,0 +1,26 @@
+{
+  "name": "Salmon DETR ResNet-50 temporal fine-tune",
+  "source_checkpoint": "runs/detr_clean_labels_unfrozen_5ep/best.pth",
+  "source_epoch": 1,
+  "selection": "User-selected unfrozen fine-tune; historical best checkpoint selected by count MAE, not loss.",
+  "input_size": 512,
+  "num_queries": 100,
+  "num_context_frames": 2,
+  "context_stride": 20,
+  "photo_context_policy": "zeros_after_normalization",
+  "video_context_policy": "t, max(0,t-20), max(0,t-40)",
+  "score_threshold": 0.25,
+  "iou_nms": 0.5,
+  "distance_nms": 50,
+  "validation": {
+    "tasks": 153,
+    "count_mae": 23.019607843137255,
+    "count_rmse": 31.45,
+    "point_ap": 0.807,
+    "point_recall": 0.873,
+    "max_gt_crowding": 0.2
+  },
+  "sha256": "71a13c3d46ad5dcce2d3c579bc3907ba361ef3e4d244b0ebe6a7c7f8d507b748",
+  "bytes": 166665634,
+  "torch": "2.5.1+cu121"
+}

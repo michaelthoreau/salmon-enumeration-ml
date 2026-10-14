@@ -1,0 +1,11 @@
+torch==2.5.1
+torchvision==0.20.1
+transformers==5.12.1
+timm
+numpy
+scipy
+opencv-python
+Pillow
+fire
+tqdm
+requests
