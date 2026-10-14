@@ -147,7 +147,11 @@ The released inference-only weights and provenance are in [release/salmon-detr/m
 ### 4.2 Non-Maximum Suppression (Two-Stage)
 
 1. **IoU NMS** (threshold = 0.5): Standard box-based NMS to remove overlapping detections across tile boundaries
-2. **Point-distance NMS** (demo threshold = 50 px): Removes detections whose centers are strictly closer than 50 px (handles near-duplicates that IoU NMS misses)
+2. **Point-distance NMS** (demo / pipeline default = 45 px): Removes detections whose centers are strictly closer than 45 px (handles near-duplicates that IoU NMS misses)
+
+The demo uses the pipeline's detection and tracking confidence default of 0.35.
+The historical validation results above used confidence 0.25 and distance NMS
+50 px; they are not measurements at the current demo defaults.
 
 ### 4.3 Multi-Object Tracking (BYTETracker)
 
