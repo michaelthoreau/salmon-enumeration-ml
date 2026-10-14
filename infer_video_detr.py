@@ -425,10 +425,42 @@ def _draw_motion_panel(frame: np.ndarray, mean_speed: float, num_tracks: int, me
     return frame
 
 
-def _draw_line_panel(frame: np.ndarray, count_up: int, count_down: int, margin: int = 20) -> np.ndarray:
+class _FuzzyCrossingEstimate:
+    def __init__(self, height, fps, window):
+        if height <= 0 or fps <= 0 or window < 1:
+            raise ValueError('Height, FPS, and averaging window must be positive.')
+        self.height = height
+        self.fps = fps
+        self.counts = deque(maxlen=window)
+        self.previous_frame = None
+        self.previous_rates = np.zeros(2)
+        self.totals = np.zeros(2)
+
+    def update(self, frame_index, count, vectors):
+        if self.previous_frame is not None and frame_index <= self.previous_frame:
+            raise ValueError('Source frame indices must increase.')
+        self.counts.append(count)
+        mean_count = sum(self.counts) / len(self.counts)
+        rates = np.zeros(2)
+        if len(vectors):
+            vertical = np.asarray(vectors)[:, 1]
+            rates = mean_count / self.height * np.array([
+                np.maximum(-vertical, 0).mean(), np.maximum(vertical, 0).mean(),
+            ])
+        if self.previous_frame is not None:
+            elapsed = (frame_index - self.previous_frame) / self.fps
+            self.totals += (self.previous_rates + rates) * 0.5 * elapsed
+        self.previous_frame = frame_index
+        self.previous_rates = rates
+        return {'up': float(self.totals[0]), 'down': float(self.totals[1]),
+                'net': float(self.totals[1] - self.totals[0]),
+                'total': float(self.totals.sum()), 'moving_average_count': mean_count}
+
+
+def _draw_line_panel(frame: np.ndarray, count_up: int, count_down: int, margin: int = 20, fuzzy: dict | None = None) -> np.ndarray:
     """Overlay a line-crossing stats panel in the top-right corner."""
     H, W = frame.shape[:2]
-    pw, ph = 260, 115
+    pw, ph = 430, 139
     px = W - pw - margin
     py = margin
 
@@ -441,16 +473,23 @@ def _draw_line_panel(frame: np.ndarray, count_up: int, count_down: int, margin: 
     frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
 
     net = count_up - count_down
-    cv2.putText(frame, "LINE CROSSINGS", (px + 16, py + 26),
+    cv2.putText(frame, "LINE CROSSINGS: ACTUAL | FUZZY", (px + 16, py + 26),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
 
-    cv2.putText(frame, f"Down (v): {count_down}", (px + 16, py + 52),
+    fuzzy_down = f"{fuzzy['down']:.1f}" if fuzzy is not None else 'N/A'
+    fuzzy_up = f"{fuzzy['up']:.1f}" if fuzzy is not None else 'N/A'
+    fuzzy_net = f"{-fuzzy['net']:+.1f}" if fuzzy is not None else 'N/A'
+    cv2.putText(frame, f"Down (v): {count_down} | {fuzzy_down}", (px + 16, py + 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 215, 90), 2, cv2.LINE_AA)
 
-    cv2.putText(frame, f"Up (^)  : {count_up}", (px + 16, py + 76),
+    cv2.putText(frame, f"Up (^)  : {count_up} | {fuzzy_up}", (px + 16, py + 76),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, (80, 200, 255), 2, cv2.LINE_AA)
 
-    cv2.putText(frame, f"Net     : {net:+d}", (px + 16, py + 100),
+    cv2.putText(frame, f"Net     : {net:+d} | {fuzzy_net}", (px + 16, py + 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+
+    fuzzy_total = f"{fuzzy['total']:.1f}" if fuzzy is not None else 'N/A'
+    cv2.putText(frame, f"Total   : {count_up + count_down} | {fuzzy_total}", (px + 16, py + 124),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
 
     return frame
@@ -788,6 +827,8 @@ class Pipeline:
         metrics_speeds = {}
         metrics_directions = {}
         metrics_line_counts = {}
+        metrics_fuzzy_counts = {}
+        fuzzy_estimate = _FuzzyCrossingEstimate(height, fps, ma_window)
 
         # Horizontal counting line position setup
         if line_position is not None:
@@ -845,6 +886,7 @@ class Pipeline:
                     "prev_pos": prev_pos
                 })
 
+            filtered_vectors = []
             if len(motion_vectors) > 0:
                 filtered_vectors = reject_outliers_iqr(motion_vectors)
                 if len(filtered_vectors) > 0:
@@ -868,6 +910,7 @@ class Pipeline:
                 "net": count_down - count_up,
                 "line_y": y_line
             }
+            metrics_fuzzy_counts[frame_idx] = fuzzy_estimate.update(frame_idx, len(frame_centroids), filtered_vectors)
             count_history.append(len(frame_centroids))
 
         out_data = {
@@ -880,7 +923,8 @@ class Pipeline:
                 "frame_counts": metrics_counts,
                 "frame_speeds": metrics_speeds,
                 "frame_directions": metrics_directions,
-                "line_counts": metrics_line_counts
+                "line_counts": metrics_line_counts,
+                "fuzzy_line_counts": metrics_fuzzy_counts
             }
         }
 
@@ -976,6 +1020,7 @@ class Pipeline:
         frame_speeds = metrics.get("frame_speeds", {})
         frame_directions = metrics.get("frame_directions", {})
         line_counts = metrics.get("line_counts", {})
+        fuzzy_counts = metrics.get("fuzzy_line_counts", {})
 
         pbar = tqdm(total=len(sorted_keys), desc='Rendering', unit='frame', ncols=100)
         
@@ -1044,7 +1089,8 @@ class Pipeline:
                 cv2.line(out_frame, (0, y_line_scaled), (w_out, y_line_scaled), (0, 235, 255), 2, cv2.LINE_AA)
                 cv2.putText(out_frame, f"COUNTING LINE (Y={y_line})", (20, max(y_line_scaled - 8, 20)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 235, 255), 1, cv2.LINE_AA)
-                out_frame = _draw_line_panel(out_frame, up_cnt, down_cnt)
+                fuzzy = fuzzy_counts.get(f_str, fuzzy_counts.get(f_int))
+                out_frame = _draw_line_panel(out_frame, up_cnt, down_cnt, fuzzy=fuzzy)
 
             writer.write(out_frame)
             pbar.update(1)
