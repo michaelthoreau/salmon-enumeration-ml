@@ -172,6 +172,19 @@ The historical validation results above used confidence 0.25 and distance NMS
   - Track transitions from below → above: `count_up += 1`
   - Net count = `count_down - count_up` (or vice versa depending on flow direction)
 
+  **Fuzzy estimate:** Alongside actual crossings, tracking integrates a rough fish
+  flux: moving-average active fish count × mean directional vertical velocity ÷
+  source-frame height. Separate up/down rates are integrated over elapsed source
+  video time, so skipped frames do not shorten the interval. The JSON metric
+  `metrics.fuzzy_line_counts` retains cumulative up/down, net (down minus up), total
+  crossings, and moving-average fish count. The overlay shows estimates to one
+  decimal beside actual counts, using the panel's up-minus-down net convention.
+
+  This assumes roughly uniform fish density across the frame and representative
+  tracked motion. It is not an independent count or a unique-fish estimate: camera
+  motion, uneven density, missed detections, and track failures can bias it. Missing
+  velocity contributes zero rate; motion-history warmup is not extrapolated backward.
+
 ### 4.5 Video Rendering
 
 The final annotated video includes:
