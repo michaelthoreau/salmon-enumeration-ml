@@ -81,7 +81,7 @@ def _expand_first_conv_6ch(model, in_channels: int = 6):
             return
 
 
-def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
+def load_model(checkpoint: str, num_queries: int, companion_mode: str | None, device: str = 'cuda', strict: bool = False):
     from transformers import DetrConfig, DetrForObjectDetection
 
     ckpt        = torch.load(checkpoint, map_location='cpu', weights_only=False)
@@ -89,6 +89,7 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
     config = DetrConfig(
         num_labels=NUM_CLASSES,
         num_queries=config_dict.get('num_queries', num_queries),
+        use_pretrained_backbone=False,
     )
     model = DetrForObjectDetection(config)
     
@@ -161,8 +162,8 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None):
                     
         new_state_dict[k] = v
         
-    model.load_state_dict(new_state_dict, strict=False)
-    model.eval().cuda()
+    model.load_state_dict(new_state_dict, strict=strict)
+    model.eval().to(device)
     return model
 
 
@@ -181,9 +182,15 @@ def _get_model_in_channels(model) -> int:
     return 3
 
 
-def _tile_tensor(crop: Image.Image, companion_crop: Image.Image | None, target_channels: int = 3) -> torch.Tensor:
+def _tile_tensor(crop: Image.Image, companion_crop: Image.Image | list[Image.Image] | None, target_channels: int = 3, zero_context: bool = False) -> torch.Tensor:
     t = _normalize(T.functional.to_tensor(crop))
-    if companion_crop is not None:
+    if zero_context:
+        return torch.cat([t, torch.zeros(target_channels - 3, *t.shape[1:], dtype=t.dtype)])
+    if isinstance(companion_crop, list):
+        t = torch.cat([t] + [_normalize(T.functional.to_tensor(context)) for context in companion_crop])
+        if t.shape[0] != target_channels:
+            raise ValueError('Context count does not match the model input channels.')
+    elif companion_crop is not None:
         c = _normalize(T.functional.to_tensor(companion_crop))
         t = torch.cat([t, c], dim=0)
 
@@ -193,7 +200,7 @@ def _tile_tensor(crop: Image.Image, companion_crop: Image.Image | None, target_c
     return t
 
 
-def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | None, target_channels: int = 3, tile_overlap: int = 128):
+def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | list[Image.Image] | None, target_channels: int = 3, tile_overlap: int = 128, zero_context: bool = False):
     """Sliding tiles with overlap to prevent boundary clipping; last tile slides back at edges."""
     W, H = pil.size
     stride = max(S - tile_overlap, 64) if tile_overlap > 0 else S
@@ -208,15 +215,17 @@ def _make_tiles(pil: Image.Image, S: int, companion_pil: Image.Image | None, tar
 
     if W < S or H < S:
         pil_r  = pil.resize((S, S), Image.BILINEAR)
-        comp_r = companion_pil.resize((S, S), Image.BILINEAR) if companion_pil else None
-        return [(_tile_tensor(pil_r, comp_r, target_channels=target_channels), 0, 0)]
+        comp_r = ([context.resize((S, S), Image.BILINEAR) for context in companion_pil]
+              if isinstance(companion_pil, list) else companion_pil.resize((S, S), Image.BILINEAR) if companion_pil else None)
+        return [(_tile_tensor(pil_r, comp_r, target_channels=target_channels, zero_context=zero_context), 0, 0)]
 
     tiles = []
     for y0 in origins(H):
         for x0 in origins(W):
             crop = pil.crop((x0, y0, x0 + S, y0 + S))
-            comp = companion_pil.crop((x0, y0, x0 + S, y0 + S)) if companion_pil else None
-            tiles.append((_tile_tensor(crop, comp, target_channels=target_channels), x0, y0))
+            comp = ([context.crop((x0, y0, x0 + S, y0 + S)) for context in companion_pil]
+                    if isinstance(companion_pil, list) else companion_pil.crop((x0, y0, x0 + S, y0 + S)) if companion_pil else None)
+            tiles.append((_tile_tensor(crop, comp, target_channels=target_channels, zero_context=zero_context), x0, y0))
     return tiles
 
 
@@ -244,7 +253,8 @@ def _infer_batch(
     tile_batch_size: int = 16,
     box_size: int = 50,
     min_dist: float = 45.0,
-    tile_overlap: int = 128
+    tile_overlap: int = 128,
+    zero_context: bool = False,
 ) -> list[list[tuple[int, int, float, float, float, float, float]]]:
     """
     Infer on multiple frames.  Tiles are collected across all frames and sent
@@ -259,9 +269,10 @@ def _infer_batch(
     all_tile_info: list[tuple[torch.Tensor, int, int, int]] = []
     for fi, (frame_bgr, companion_bgr) in enumerate(frames):
         pil      = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        comp_pil = (Image.fromarray(cv2.cvtColor(companion_bgr, cv2.COLOR_BGR2RGB))
-                    if companion_bgr is not None else None)
-        for tile_t, tx, ty in _make_tiles(pil, S, comp_pil, target_channels=target_channels, tile_overlap=tile_overlap):
+        comp_pil = ([Image.fromarray(cv2.cvtColor(context, cv2.COLOR_BGR2RGB)) for context in companion_bgr]
+                if isinstance(companion_bgr, list) else Image.fromarray(cv2.cvtColor(companion_bgr, cv2.COLOR_BGR2RGB))
+                if companion_bgr is not None else None)
+        for tile_t, tx, ty in _make_tiles(pil, S, comp_pil, target_channels=target_channels, tile_overlap=tile_overlap, zero_context=zero_context):
             all_tile_info.append((tile_t, tx, ty, fi))
 
     # 2. Forward pass in GPU sub-batches
@@ -270,8 +281,9 @@ def _infer_batch(
 
     for start in range(0, len(all_tile_info), tile_batch_size):
         sub = all_tile_info[start: start + tile_batch_size]
-        pv  = torch.stack([t for t, _, _, _ in sub]).cuda()
-        pm  = torch.ones(len(sub), S, S, dtype=torch.long).cuda()
+        device = next(model.parameters()).device
+        pv  = torch.stack([t for t, _, _, _ in sub]).to(device)
+        pm  = torch.ones(len(sub), S, S, dtype=torch.long, device=device)
         out = model(pixel_values=pv, pixel_mask=pm)
         logits = out.logits.cpu()      # [B, Q, C+1]
         boxes  = out.pred_boxes.cpu()  # [B, Q, 4]
@@ -319,6 +331,11 @@ def _infer_batch(
                         dist_kept.append(r)
                 frame_res = dist_kept
 
+            height, width = frames[fi][0].shape[:2]
+            if width < S or height < S:
+                frame_res = [(round(result[0] * width / S), round(result[1] * height / S),
+                              result[2] * width / S, result[3] * height / S,
+                              result[4] * width / S, result[5] * height / S, result[6]) for result in frame_res]
             results.append(frame_res)
         else:
             results.append([])
@@ -507,6 +524,11 @@ def _draw_count_graph(
 # Pipeline Wrapper
 # ---------------------------------------------------------------------------
 
+def _context_frames(frame_buffer, count, stride):
+    return [frame_buffer[max(0, len(frame_buffer) - 1 - stride * offset)]
+            for offset in range(1, count + 1)]
+
+
 class Pipeline:
     def detect(
         self,
@@ -526,17 +548,23 @@ class Pipeline:
         detect_height: int | None = None,
         box_size: int = 50,
         min_dist: float = 45.0,
-        tile_overlap: int = 128
+        tile_overlap: int = 128,
+        context_stride: int = 20,
+        device: str = 'cuda',
+        max_frames: int = 0,
+        strict: bool = False,
     ) -> dict:
         """
         Stage 1: GPU-bound inference. Processes video from start_sec to start_sec+duration_sec,
         computes bounding boxes, and returns them. Also saves them to output_json if provided.
         """
         video_path = Path(video)
+        if infer_every < 1 or context_stride < 1 or batch_frames < 1 or tile_batch_size < 1 or max_frames < 0:
+            raise ValueError('Inference stride, context stride, and batch sizes must be positive; max_frames nonnegative.')
         
         # ---- load model ----
         print(f'Loading checkpoint: {checkpoint}')
-        model = load_model(checkpoint, num_queries, companion_mode)
+        model = load_model(checkpoint, num_queries, companion_mode, device=device, strict=strict)
         print(f'Model loaded  |  companion_mode={companion_mode}  |  img_size={img_size}  |  min_dist={min_dist}px  |  tile_overlap={tile_overlap}px')
 
         # ---- open video ----
@@ -557,6 +585,10 @@ class Pipeline:
             end_frame = total_frames
             n_to_process = end_frame - start_frame
 
+        if max_frames:
+            end_frame = min(end_frame, start_frame + max_frames)
+        n_to_process = end_frame - start_frame
+
         # Resizing configuration
         scale = None
         if detect_height is not None and detect_height < h_vid:
@@ -572,11 +604,14 @@ class Pipeline:
 
         # ---- frame buffer for companion ----
         PREV_OFFSET    = 10
-        frame_buffer: deque[np.ndarray] = deque(maxlen=PREV_OFFSET + 1)
+        context_count = (_get_model_in_channels(model) - 3) // 3
+        temporal_context = context_count > 1 or companion_mode == 'temporal'
+        history_length = context_stride * context_count if temporal_context else PREV_OFFSET
+        frame_buffer: deque[np.ndarray] = deque(maxlen=history_length + 1)
         
         # Pre-populate companion buffer if starting in the middle
-        if companion_mode == 'prev10' and start_frame > 0:
-            buffer_start = max(0, start_frame - PREV_OFFSET)
+        if (temporal_context or companion_mode == 'prev10') and start_frame > 0:
+            buffer_start = max(0, start_frame - history_length)
             cap.set(cv2.CAP_PROP_POS_FRAMES, buffer_start)
             for _ in range(start_frame - buffer_start):
                 ok, f = cap.read()
@@ -601,7 +636,8 @@ class Pipeline:
             for f, c, _ in infer_in_block:
                 if scale is not None:
                     f_resized = cv2.resize(f, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR)
-                    c_resized = cv2.resize(c, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR) if c is not None else None
+                    c_resized = ([cv2.resize(context, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR) for context in c]
+                                 if isinstance(c, list) else cv2.resize(c, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR) if c is not None else None)
                     frames_to_infer.append((f_resized, c_resized))
                 else:
                     frames_to_infer.append((f, c))
@@ -646,7 +682,8 @@ class Pipeline:
                 break
 
             frame_buffer.append(frame_bgr)
-            companion_bgr = frame_buffer[0] if companion_mode == 'prev10' else None
+            companion_bgr = (_context_frames(frame_buffer, context_count, context_stride) if temporal_context
+                             else frame_buffer[0] if companion_mode == 'prev10' else None)
 
             block_pos = len(frame_block)
             frame_block.append((frame_bgr, companion_bgr))
@@ -674,6 +711,7 @@ class Pipeline:
             "start_frame": start_frame,
             "end_frame": end_frame,
             "infer_every": infer_every,
+            "context_stride": context_stride,
             "detections": detections_out
         }
 
@@ -1034,7 +1072,7 @@ class Pipeline:
         graph_height: int = 280,
         graph_width: int = 700,
         dot_radius: int = 6,
-        infer_every: int = 1,
+        infer_every: int = 3,
         batch_frames: int = 1,
         tile_batch_size: int = 16,
         traverse_seconds: float = 25.0,
@@ -1044,7 +1082,11 @@ class Pipeline:
         render_height: int | None = 1080,
         line_position: float | None = 0.5,
         min_dist: float = 45.0,
-        tile_overlap: int = 128
+        tile_overlap: int = 128,
+        context_stride: int = 20,
+        device: str = 'cuda',
+        max_frames: int = 0,
+        strict: bool = False,
     ):
         """
         Run the entire pipeline (Detect -> Track -> Render) sequentially in memory.
@@ -1056,7 +1098,8 @@ class Pipeline:
             score_thresh=score_thresh, iou_thresh=iou_thresh, num_queries=num_queries,
             companion_mode=companion_mode, batch_frames=batch_frames,
             tile_batch_size=tile_batch_size, infer_every=infer_every,
-            detect_height=detect_height, min_dist=min_dist, tile_overlap=tile_overlap
+            detect_height=detect_height, min_dist=min_dist, tile_overlap=tile_overlap,
+            context_stride=context_stride, device=device, max_frames=max_frames, strict=strict,
         )
 
         print("\n=== STAGE 2: TRACKING ===")

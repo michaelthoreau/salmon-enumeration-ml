@@ -16,6 +16,10 @@ from functools import lru_cache
 
 ORTHO_TILE_SIZE = 256
 
+def is_photo_task(task):
+    filename = urllib.parse.urlparse(task.get('fileKey', '')).path
+    return os.path.splitext(filename)[1].lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp', '.bmp'}
+
 class SameFrameBatchSampler(torch.utils.data.Sampler):
     def __init__(self, dataset_size, batch_size):
         self.dataset_size = dataset_size
@@ -105,7 +109,8 @@ class SockeyeApiDataset(Dataset):
     def __init__(self, api_url, api_key, tasks, cache_dir="/tmp/frame_cache",
                  img_size=512, augment=False, num_context_frames=1, context_stride=5,
                  box_size=50, sigma=4.0, verbose=False, mode="iocformer",
-                 tile_server_url=None, tile_server_token=None, ortho_stitch_radius=1):
+                 tile_server_url=None, tile_server_token=None, ortho_stitch_radius=1,
+                 deterministic_crop=False):
         """
         Args:
             api_url (str): Base URL of API
@@ -134,6 +139,7 @@ class SockeyeApiDataset(Dataset):
         self.cache_dir = cache_dir
         self.img_size = img_size
         self.augment = augment
+        self.deterministic_crop = deterministic_crop
         self.num_context_frames = num_context_frames
         self.companion_mode = "prev" if num_context_frames > 0 else None
         self.context_stride = context_stride
@@ -319,6 +325,7 @@ class SockeyeApiDataset(Dataset):
     def __getitem__(self, idx):
         t_start = time.time()
         task = self.tasks[idx]
+        photo = is_photo_task(task)
         file_id = task["fileId"]
         frame_t = task["frame"]
         
@@ -350,12 +357,14 @@ class SockeyeApiDataset(Dataset):
         
         t0 = time.time()
         # Extract/augment crops
-        if self.augment and W_crop >= S and H_crop >= S:
+        if (self.augment or self.deterministic_crop) and W_crop >= S and H_crop >= S:
             points_crop = [[px - x1, py - y1] for px, py in points]
             
             # Try up to 15 times to crop a region with at least one point, if points exist
             x0, y0 = 0, 0
-            if len(points_crop) > 0:
+            if self.deterministic_crop and not self.augment:
+                x0, y0 = (W_crop - S) // 2, (H_crop - S) // 2
+            elif len(points_crop) > 0:
                 for _ in range(15):
                     x0 = random.randint(0, W_crop - S)
                     y0 = random.randint(0, H_crop - S)
@@ -377,13 +386,16 @@ class SockeyeApiDataset(Dataset):
             context_crops = []
             if self.companion_mode:
                 for n_idx in range(1, self.num_context_frames + 1):
+                    if photo:
+                        context_crops.append(None)
+                        continue
                     frame_t_minus_np = max(0, frame_t - n_idx * self.context_stride)
                     crop_n = None
                     try:
                         img_context_crop = self._get_frame(file_id, frame_t_minus_np, bbox=bbox)
                         crop_n = img_context_crop.crop((x0, y0, x0 + S, y0 + S))
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        print(f'Warning: context unavailable for {file_id} frame {frame_t_minus_np}: {error}', flush=True)
                     context_crops.append(crop_n)
             W_crop, H_crop = S, S
         else:
@@ -395,13 +407,16 @@ class SockeyeApiDataset(Dataset):
             context_crops = []
             if self.companion_mode:
                 for n_idx in range(1, self.num_context_frames + 1):
+                    if photo:
+                        context_crops.append(None)
+                        continue
                     frame_t_minus_np = max(0, frame_t - n_idx * self.context_stride)
                     crop_n = None
                     try:
                         img_context_crop = self._get_frame(file_id, frame_t_minus_np, bbox=bbox)
                         crop_n = img_context_crop.resize((S, S), Image.BILINEAR)
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        print(f'Warning: context unavailable for {file_id} frame {frame_t_minus_np}: {error}', flush=True)
                     context_crops.append(crop_n)
             W_crop, H_crop = S, S
             
@@ -485,7 +500,10 @@ class SockeyeApiDataset(Dataset):
                 print(f"[DataLoader Progress] [Worker {os.getpid()}] Loaded item {idx + 1}/{len(self.tasks)} (File: {file_id}, Frame: {frame_t}) | Took {t_total:.4f}s", flush=True)
                 print(f"[DATASET] Getitem (idx={idx:04d}): target_load={t_target:.4f}s | context_load={t_context:.4f}s | process={t_processing:.4f}s | total={t_total:.4f}s", flush=True)
                 
-            return (img_crop, context_crops), {'class_labels': labels_t, 'boxes': boxes_t}
+            target = {'class_labels': labels_t, 'boxes': boxes_t}
+            if photo:
+                target['_zero_context'] = True
+            return (img_crop, context_crops), target
             
         elif self.mode == "cnn":
             # Target heatmap

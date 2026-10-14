@@ -8,3 +8,7 @@ app/node_modules/
 node_modules
 .env
 models/
+demo_outputs/
+*_annotated.mp4
+*_annotated.png
+*_annotated.json
