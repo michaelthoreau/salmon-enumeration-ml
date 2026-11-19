@@ -321,34 +321,34 @@ class BYTETracker:
 
 
 def get_motion_vector(track: STrack, current_frame_idx: int, fps: float) -> tuple[np.ndarray, float, float] | None:
-    """
-    Computes a 1-second window motion vector (pixels per second) for a track.
-    Looks back in history to find the centroid from approximately 1 second ago.
-    Requires at least fps/2 frames of history to avoid division by very small intervals.
+    """Estimate velocity from a linear fit over approximately one second.
+
+    A regression across all available history samples is less sensitive to
+    endpoint localization noise than subtracting two centroids, while sparse
+    histories and detection gaps retain the original time-based semantics.
     """
     if len(track.history) < 2:
         return None
-    target_frame = current_frame_idx - fps
-    best_item = None
-    best_diff = float('inf')
-    for cx, cy, f_id in reversed(track.history):
-        diff = abs(f_id - target_frame)
-        if diff < best_diff:
-            best_diff = diff
-            best_item = (cx, cy, f_id)
-        else:
-            # Since f_id is sorted, once diff starts increasing, we've passed the minimum
-            break
-    if best_item is None:
+
+    history = np.asarray(track.history[-max(2, int(round(fps)) + 1):], dtype=np.float64)
+    oldest_frame = history[-1, 2] - fps
+    window = history[history[:, 2] >= oldest_frame]
+    if len(window) < 2:
         return None
-    cx_prev, cy_prev, f_id_prev = best_item
-    delta_f = current_frame_idx - f_id_prev
-    if delta_f < fps / 2:
+
+    time_s = (window[:, 2] - window[0, 2]) / fps
+    span_frames = window[-1, 2] - window[0, 2]
+    if span_frames < fps / 2:
         return None
-    dt = delta_f / fps
-    vx = (track.history[-1][0] - cx_prev) / dt
-    vy = (track.history[-1][1] - cy_prev) / dt
-    return np.array([vx, vy], dtype=np.float32), cx_prev, cy_prev
+
+    # Centered time avoids numerical conditioning problems. The slope is px/s.
+    centered_time = time_s - time_s.mean()
+    denominator = float(np.dot(centered_time, centered_time))
+    if denominator <= 1e-12:
+        return None
+    vx = float(np.dot(centered_time, window[:, 0] - window[:, 0].mean()) / denominator)
+    vy = float(np.dot(centered_time, window[:, 1] - window[:, 1].mean()) / denominator)
+    return np.array([vx, vy], dtype=np.float32), float(window[0, 0]), float(window[0, 1])
 
 
 def reject_outliers_iqr(vectors: np.ndarray | list[np.ndarray]) -> np.ndarray:
