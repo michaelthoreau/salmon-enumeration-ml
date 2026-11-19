@@ -313,19 +313,27 @@ short-lived tracks cause the direct line counter to overcount.
 
 ### Clean baseline
 
-<video src="debug/counting_error_animations/clean_baseline.mp4" controls muted loop width="800"></video>
+[Download MP4](debug/counting_error_animations/clean_baseline.mp4)
+
+![Clean baseline animation](debug/counting_error_animations/clean_baseline.gif)
 
 ### Mild location jitter
 
-<video src="debug/counting_error_animations/mild_location_jitter.mp4" controls muted loop width="800"></video>
+[Download MP4](debug/counting_error_animations/mild_location_jitter.mp4)
+
+![Mild location jitter animation](debug/counting_error_animations/mild_location_jitter.gif)
 
 ### Random and burst detection drops
 
-<video src="debug/counting_error_animations/random_and_burst_drops.mp4" controls muted loop width="800"></video>
+[Download MP4](debug/counting_error_animations/random_and_burst_drops.mp4)
+
+![Random and burst detection drops animation](debug/counting_error_animations/random_and_burst_drops.gif)
 
 ### Fuzzy-robust false-positive case
 
-<video src="debug/counting_error_animations/fuzzy_robust_false_positives.mp4" controls muted loop width="800"></video>
+[Download MP4](debug/counting_error_animations/fuzzy_robust_false_positives.mp4)
+
+![Fuzzy-robust false-positive animation](debug/counting_error_animations/fuzzy_robust_false_positives.gif)
 
 GIF versions are stored beside the MP4 files for Markdown renderers that do not
 support embedded video. Sweep visualizations and numeric MAE/accuracy summaries
