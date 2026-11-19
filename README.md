@@ -291,5 +291,45 @@ Below is a comparison of performance on the validation task set (105 tasks) betw
 | **0.50** | 0.3250 | 0.3800 | 0.3504 | 0.1909 | 1058 | 2197 | 1726 |
 | **0.75** | 0.0768 | 0.0898 | 0.0828 | 0.0116 | 250 | 3005 | 2534 |
 
+---
+
+## Fuzzy crossing simulations
+
+`simulate_fuzzy_count.py` compares the fuzzy flux estimate with tracking-by-detection
+line crossings under controlled fish motion, location jitter, missed detections,
+correlated dropout bursts, false positives, and crowding. It uses the actual
+`BYTETracker` and writes per-frame CSV/JSON results. Parameter sweeps run in parallel.
+
+```bash
+python simulate_fuzzy_count.py --help
+python plot_sweep_errors.py
+python animate_simulations.py
+```
+
+The animation scenarios below use a 16:9 field and include an 18-second clean
+baseline, mild detection jitter, detection dropouts, and false positives. In the
+false-positive example, the truth and fuzzy estimates remain close while isolated
+short-lived tracks cause the direct line counter to overcount.
+
+### Clean baseline
+
+<video src="debug/counting_error_animations/clean_baseline.mp4" controls muted loop width="800"></video>
+
+### Mild location jitter
+
+<video src="debug/counting_error_animations/mild_location_jitter.mp4" controls muted loop width="800"></video>
+
+### Random and burst detection drops
+
+<video src="debug/counting_error_animations/random_and_burst_drops.mp4" controls muted loop width="800"></video>
+
+### Fuzzy-robust false-positive case
+
+<video src="debug/counting_error_animations/fuzzy_robust_false_positives.mp4" controls muted loop width="800"></video>
+
+GIF versions are stored beside the MP4 files for Markdown renderers that do not
+support embedded video. Sweep visualizations and numeric MAE/accuracy summaries
+are generated under `debug/sweep_error_plots/`.
+
 
 

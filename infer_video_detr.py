@@ -159,7 +159,7 @@ def load_model(checkpoint: str, num_queries: int, companion_mode: str | None, de
                 k_alt = k.replace(".fc2.", ".mlp.fc2.", 1)
                 if k_alt in model_keys:
                     k = k_alt
-                    
+
         new_state_dict[k] = v
         
     model.load_state_dict(new_state_dict, strict=strict)
@@ -432,6 +432,7 @@ class _FuzzyCrossingEstimate:
         self.height = height
         self.fps = fps
         self.counts = deque(maxlen=window)
+        self.vector_counts = deque(maxlen=window)
         self.previous_frame = None
         self.previous_rates = np.zeros(2)
         self.totals = np.zeros(2)
@@ -440,13 +441,28 @@ class _FuzzyCrossingEstimate:
         if self.previous_frame is not None and frame_index <= self.previous_frame:
             raise ValueError('Source frame indices must increase.')
         self.counts.append(count)
+        self.vector_counts.append(len(vectors))
         mean_count = sum(self.counts) / len(self.counts)
+        mean_vector_count = sum(self.vector_counts) / len(self.vector_counts)
         rates = np.zeros(2)
         if len(vectors):
             vertical = np.asarray(vectors)[:, 1]
-            rates = mean_count / self.height * np.array([
-                np.maximum(-vertical, 0).mean(), np.maximum(vertical, 0).mean(),
-            ])
+            if len(vertical) >= 4:
+                median = float(np.median(vertical))
+                mad = float(np.median(np.abs(vertical - median)))
+                if mad > 1e-6:
+                    vertical = vertical[np.abs(vertical - median) <= 3.5 * 1.4826 * mad]
+                elif np.all(np.abs(vertical - median) < 1e-6):
+                    vertical = np.full_like(vertical, median)
+            if len(vertical) == 0:
+                vertical = np.zeros(1)
+            # Align both numerator and denominator to the same moving window.
+            population_scale = mean_count / max(len(vertical), 1e-12)
+            # Missing tracks are represented by ByteTrack's recoverable set;
+            # otherwise each observed fish contributes its measured velocity once.
+            rates = np.array([
+                np.maximum(-vertical, 0).sum(), np.maximum(vertical, 0).sum(),
+            ]) / self.height
         if self.previous_frame is not None:
             elapsed = (frame_index - self.previous_frame) / self.fps
             self.totals += (self.previous_rates + rates) * 0.5 * elapsed
@@ -768,7 +784,7 @@ class Pipeline:
     def track(
         self,
         detection_jsons: list[str] | str | dict,
-        output_track_json: str | None = None,
+        output_track_json: str | None,
         track_thresh: float = 0.35,
         min_box_score: float = 0.1,
         ma_window: int = 30,
@@ -886,6 +902,18 @@ class Pipeline:
                     "prev_pos": prev_pos
                 })
 
+            # Append recoverable lost-track motion after active-track display processing
+            for lost_track in tracker.lost_stracks:
+                lost_motion = get_motion_vector(lost_track, frame_idx, fps)
+                if lost_motion is not None:
+                    motion_vectors.append(lost_motion[0])
+
+            metrics_fuzzy_counts[frame_idx] = fuzzy_estimate.update(
+                frame_idx,
+                len(frame_centroids) + len(tracker.lost_stracks),
+                motion_vectors,
+            )
+
             filtered_vectors = []
             if len(motion_vectors) > 0:
                 filtered_vectors = reject_outliers_iqr(motion_vectors)
@@ -910,7 +938,6 @@ class Pipeline:
                 "net": count_down - count_up,
                 "line_y": y_line
             }
-            metrics_fuzzy_counts[frame_idx] = fuzzy_estimate.update(frame_idx, len(frame_centroids), filtered_vectors)
             count_history.append(len(frame_centroids))
 
         out_data = {
