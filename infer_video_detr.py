@@ -359,10 +359,13 @@ def _draw_centroids(frame: np.ndarray, centroids: list, radius: int = 6) -> np.n
         
         if prev_pos is not None:
             px, py = prev_pos
-            # Draw arrowed line representing the motion vector
-            cv2.arrowedLine(frame, (px, py), (x, y), (255, 220, 0), 2, cv2.LINE_AA, 0, 0.15)
-            # Also draw a small green circle at the head
-            cv2.circle(frame, (x, y), 4, (0, 220, 80), -1)
+            dx, dy = x - px, y - py
+            distance = math.hypot(dx, dy)
+            if distance > 42.0:
+                ratio = 42.0 / distance
+                px, py = int(x - dx * ratio), int(y - dy * ratio)
+            cv2.arrowedLine(frame, (px, py), (x, y), (255, 220, 0), 1, cv2.LINE_AA, 0, 0.18)
+            cv2.circle(frame, (x, y), max(2, radius - 1), (0, 220, 80), -1)
         else:
             # Too new, draw a simple dot
             cv2.circle(frame, (x, y), radius + 2, (0, 0, 0), -1)
@@ -373,6 +376,53 @@ def _draw_centroids(frame: np.ndarray, centroids: list, radius: int = 6) -> np.n
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
             cv2.putText(frame, f"#{track_id}", (x + radius + 4, y - 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return frame
+
+
+def _draw_detections(frame: np.ndarray, detections: list, scale: float = 1.0) -> np.ndarray:
+    """Draw a restrained outline for raw detection boxes underneath tracking overlays."""
+    frame = frame.copy()
+    for detection in detections:
+        if len(detection) < 4:
+            continue
+        x1, y1, x2, y2 = [int(float(value) * scale) for value in detection[:4]]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (90, 170, 255), 1, cv2.LINE_AA)
+    return frame
+
+
+def _draw_live_stats(frame: np.ndarray, current_count: int, moving_average: float,
+                     mean_vector: np.ndarray | None, fuzzy: dict | None,
+                     margin: int = 20) -> np.ndarray:
+    H, W = frame.shape[:2]
+    px, py = margin, margin
+    pw, ph = 410, 118
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (16, 20, 24), -1)
+    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (0, 215, 90), 1)
+    frame = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
+
+    cumulative = round(fuzzy['total']) if fuzzy is not None else 0
+    cv2.putText(frame, "COUNT", (px + 12, py + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                (150, 230, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, str(cumulative), (px + 12, py + 82), cv2.FONT_HERSHEY_SIMPLEX, 1.55,
+                (245, 245, 245), 3, cv2.LINE_AA)
+
+    flux_text = f"{fuzzy['total_rate']:.2f} fish/s" if fuzzy is not None else "-- fish/s"
+    cv2.putText(frame, flux_text, (px + 14, py + 105), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                (0, 235, 255), 1, cv2.LINE_AA)
+
+    speed = float(np.linalg.norm(mean_vector)) if mean_vector is not None else 0.0
+    cx, cy = px + 330, py + 43
+    cv2.circle(frame, (cx, cy), 22, (75, 75, 75), 1, cv2.LINE_AA)
+    if mean_vector is not None and speed > 1e-3:
+        ux, uy = mean_vector / speed
+        end = (int(cx + 19 * ux), int(cy + 19 * uy))
+        cv2.arrowedLine(frame, (cx, cy), end, (255, 220, 0), 1, cv2.LINE_AA, 0, 0.25)
+    cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1)
+    speed_text = f"{round(moving_average)} fish @ {speed:.1f} px/s"
+    text_size = cv2.getTextSize(speed_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+    cv2.putText(frame, speed_text, (cx - text_size[0] // 2, py + 92),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
     return frame
 
 
@@ -470,7 +520,9 @@ class _FuzzyCrossingEstimate:
         self.previous_rates = rates
         return {'up': float(self.totals[0]), 'down': float(self.totals[1]),
                 'net': float(self.totals[1] - self.totals[0]),
-                'total': float(self.totals.sum()), 'moving_average_count': mean_count}
+                'total': float(self.totals.sum()),
+                'up_rate': float(rates[0]), 'down_rate': float(rates[1]),
+                'total_rate': float(rates.sum()), 'moving_average_count': mean_count}
 
 
 def _draw_line_panel(frame: np.ndarray, count_up: int, count_down: int, margin: int = 20, fuzzy: dict | None = None) -> np.ndarray:
@@ -839,6 +891,7 @@ class Pipeline:
         tracker = BYTETracker(track_thresh=track_thresh, track_buffer=ma_window, min_box_score=min_box_score)
 
         tracks_data = {}
+        detections_data = {}
         metrics_counts = {}
         metrics_speeds = {}
         metrics_directions = {}
@@ -929,6 +982,7 @@ class Pipeline:
                 last_mean_vector = None
 
             tracks_data[frame_idx] = frame_centroids
+            detections_data[frame_idx] = detections
             metrics_counts[frame_idx] = len(frame_centroids)
             metrics_speeds[frame_idx] = round(last_mean_speed, 2)
             metrics_directions[frame_idx] = [round(float(v), 3) for v in last_mean_vector] if last_mean_vector is not None else None
@@ -946,6 +1000,7 @@ class Pipeline:
             "width": width,
             "height": height,
             "tracks": tracks_data,
+            "detections": detections_data,
             "metrics": {
                 "frame_counts": metrics_counts,
                 "frame_speeds": metrics_speeds,
@@ -978,7 +1033,7 @@ class Pipeline:
         dot_radius: int = 6,
         traverse_seconds: float = 25.0,
         ma_window: int = 30,
-        render_height: int | None = 1080
+        render_height: int | None = 1440
     ) -> str:
         """
         Stage 3: CPU/UI-bound rendering. Takes tracking JSON/dict and original video, 
@@ -1015,6 +1070,7 @@ class Pipeline:
             h_out = h_vid
 
         tracks_dict = track_data.get("tracks", {})
+        detections_dict = track_data.get("detections", {})
         
         # Determine sorted keys within start and end frame bounds
         sorted_keys = sorted(int(k) for k in tracks_dict.keys())
@@ -1098,26 +1154,21 @@ class Pipeline:
             mean_vector_val = last_mean_vector * scale if last_mean_vector is not None else None
 
             ma_val    = sum(count_history) / max(len(count_history), 1)
+            frame_detections = detections_dict.get(f_str, detections_dict.get(f_int, []))
             out_frame = _draw_centroids(frame_bgr, scaled_centroids, radius=dot_radius)
-            out_frame = _draw_count_graph(
-                out_frame, count_history, ma_window,
-                graph_h=graph_height, graph_w=graph_width,
-                fps=fps_out
-            )
-            out_frame = _draw_motion_panel(out_frame, mean_speed_val, len(scaled_centroids), mean_vector_val)
 
-            # Line crossing overlay
             line_info = line_counts.get(f_str, line_counts.get(f_int, None))
+            fuzzy = fuzzy_counts.get(f_str, fuzzy_counts.get(f_int))
+            out_frame = _draw_live_stats(
+                out_frame, len(scaled_centroids), ma_val, mean_vector_val, fuzzy,
+            )
+
             if line_info is not None:
                 up_cnt = line_info.get("up", 0)
                 down_cnt = line_info.get("down", 0)
-                y_line = line_info.get("y_line", int(0.5 * h_vid))
+                y_line = line_info.get("line_y", int(0.5 * h_vid))
                 y_line_scaled = int(y_line * scale)
-                cv2.line(out_frame, (0, y_line_scaled), (w_out, y_line_scaled), (0, 235, 255), 2, cv2.LINE_AA)
-                cv2.putText(out_frame, f"COUNTING LINE (Y={y_line})", (20, max(y_line_scaled - 8, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 235, 255), 1, cv2.LINE_AA)
-                fuzzy = fuzzy_counts.get(f_str, fuzzy_counts.get(f_int))
-                out_frame = _draw_line_panel(out_frame, up_cnt, down_cnt, fuzzy=fuzzy)
+                cv2.line(out_frame, (0, y_line_scaled), (w_out, y_line_scaled), (0, 235, 255), 1, cv2.LINE_AA)
 
             writer.write(out_frame)
             pbar.update(1)
@@ -1152,7 +1203,7 @@ class Pipeline:
         track_thresh: float = 0.35,
         min_box_score: float = 0.1,
         detect_height: int | None = None,
-        render_height: int | None = 1080,
+        render_height: int | None = 1440,
         line_position: float | None = 0.5,
         min_dist: float = 45.0,
         tile_overlap: int = 128,
