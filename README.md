@@ -4,6 +4,14 @@ Salmon counting from aerial/underwater imagery using DETR, adapted to work with 
 
 ---
 
+## Inference demo — second half at 4× speed
+
+[Watch or download the 4× inference demo](debug/DJI_20260630113646_0002_inference_second_half_4x.mp4)
+
+This 37.7-second clip shows the second half of the five-minute 2-minute-window inference run, accelerated 4×.
+
+---
+
 ## Setup
 
 ```bash
