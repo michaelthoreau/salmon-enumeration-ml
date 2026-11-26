@@ -217,6 +217,8 @@ All Modal integrations are deprecated; use the local DETR training entry points 
 | `train_detr.py` | DETR training from local JPEGs and JSON annotations |
 | `dataset_api.py` | Shared API dataset and frame caching |
 | `eval_detr_api.py` | DETR evaluation |
+| `eval_ortho_local.py` | Local orthomosaic evaluation: `/predict_ortho` replica vs stitched + TTA |
+| `plot_ortho_eval.py` | README figures for the ortho evaluation |
 | `infer_video_detr.py` | Tiled DETR video inference, tracking, and rendering |
 | `tracker.py` | Tracking and line-crossing enumeration |
 | `mlflow_server.py` | MLflow tracking server |
@@ -298,6 +300,98 @@ Below is a comparison of performance on the validation task set (105 tasks) betw
 | **0.25** | 0.5948 | 0.6954 | 0.6412 | 0.6102 | 1936 | 1319 | 848 |
 | **0.50** | 0.3250 | 0.3800 | 0.3504 | 0.1909 | 1058 | 2197 | 1726 |
 | **0.75** | 0.0768 | 0.0898 | 0.0828 | 0.0116 | 250 | 3005 | 2534 |
+
+---
+
+## Orthomosaic detection
+
+`eval_ortho_local.py` scores ortho inference strategies against point labels on a local
+GeoTIFF, with no Modal or tile server needed. `gdalwarp` stands in for the tile server
+(EPSG:3857, tile-aligned) and processes the ortho in strips, so memory and disk stay small.
+
+- **`endpoint_zN`** reproduces `/predict_ortho` in `predict_modal.py` step for step. It takes
+  each 256 px web-map tile at zoom N, upscales it to 512, runs it on its own, removes
+  duplicates within that tile only, and converts points to lat/lng.
+- **`stitched_<G>mm`** resamples the ortho to G mm per pixel and slides overlapping 512 px
+  windows (128 px overlap) across it. It optionally adds test-time augmentation (TTA): the
+  model also runs on rotated and flipped copies of each window. Detections within
+  `--merge_m` on the ground are merged into one fish.
+
+![Current endpoint vs stitched + TTA on the same crop](debug/ortho_eval_figures/comparison_1.jpg)
+
+![Best F1 by method](debug/ortho_eval_figures/f1_by_method.png)
+
+### Results
+
+- **Test data:** one ortho, 164 labelled fish, about 185 m × 535 m at 7.4 mm per pixel.
+- **Model:** `models/best_without_context`, which was trained on video only and has never
+  seen ortho imagery.
+- **Scoring:** a detection counts as correct within 0.5 m of a label, and duplicates within
+  0.5 m are merged. Only the labels' bounding box (plus 5 m) is scored, and each row uses
+  its own best score threshold.
+- **Times** are on an RTX 2060 for the labelled area.
+
+| Method | Model runs per window | AP | F1 | Recall | Precision | Detections | Time |
+|---|---|---|---|---|---|---|---|
+| **Production** (endpoint, falls back to zoom 21) | 1 | 0.18 | 0.32 | 0.24 | 0.46 | 88 | 6 s |
+| Endpoint at zoom 22 | 1 | 0.44 | 0.49 | 0.45 | 0.53 | 141 | 18 s |
+| Stitched 9.6 mm | 1 | 0.71 | 0.72 | 0.76 | 0.68 | 182 | ~21 s |
+| Stitched 9.6 mm + flip | 2 | 0.73 | 0.79 | 0.81 | 0.78 | 170 | ~41 s |
+| **Stitched 9.6 mm + 4 rotations** | 4 | 0.78 | 0.78 | 0.79 | 0.77 | 168 | ~83 s |
+| Stitched 9.6 mm, all 8 rotations/flips | 8 | 0.79 | 0.78 | 0.71 | 0.85 | 138 | 165 s |
+| Stitched 7.4 mm, all 8 rotations/flips | 8 | 0.80 | 0.79 | 0.77 | 0.80 | 159 | 259 s |
+| 7.4 + 9.6 mm combined, all 8 rotations/flips | 16 | 0.81 | 0.79 | 0.84 | 0.75 | 182 | ~424 s |
+
+The ~ times are the measured 8-orientation time scaled by the number of orientations.
+
+**What the results show**
+
+- **The 2,000-tile cap causes the biggest loss.** `/predict_ortho` counts every tile in the
+  bounding box, so this narrow diagonal river counts as 2,914 tiles at zoom 22 when only 824
+  contain image. That pushes it down to zoom 21, where fish are about 26 px long and only a
+  quarter of them are found.
+- **Running each tile on its own costs about 20 points of recall** at the same resolution
+  (0.55 vs 0.76 after distance-based duplicate removal). Fish on tile borders are cut in
+  half, and the model sees no surrounding context.
+- **Resolution:** fish need to be roughly 50 px long or more. 9.6 mm per pixel (zoom 23, or
+  zoom 22 upscaled 2×) works about as well as the ortho's original 7.4 mm, and accuracy
+  drops steadily at coarser resolutions.
+- **Rotation TTA helps:** fish in an ortho can face any direction. A single flip raises F1
+  from 0.72 to 0.79, and 4 rotations bring AP to 0.78. Combining two resolutions adds
+  little for 2.5× the compute.
+- **Duplicate removal:** the endpoint's 20 px boxes let two detections of the same fish
+  survive. Merging anything within 0.5 m on the ground adds about 0.1 AP on its own.
+
+**Recommended `/predict_ortho` changes**
+- Use zoom-23 tiles (about 9.6 mm per pixel) with no upscaling.
+- Stitch the tiles into strips and slide overlapping windows across them.
+- Skip tiles with no image (prune from low zoom down) and drop the 2,000-tile cap.
+- Run 4-rotation TTA, or flip-only if speed matters.
+- Merge detections within 0.5 m, with a default score threshold of about 0.2.
+
+**Caveat:** there is only one labelled ortho, and the thresholds were tuned on it. Treat the
+differences between methods as solid and the absolute numbers as optimistic until a second
+ortho is labelled.
+
+### Running it
+
+```bash
+python eval_ortho_local.py \
+    --tif ortho/inputs/<flight>.tif --labels ortho/inputs/<flight>.json \
+    --zooms 21,22 --gsd_mm 9.6,7.4 --tta d4 --ensembles 7.4+9.6 --out debug/ortho_eval_tta
+
+# Re-score saved detections with different merge/match settings (no model run)
+python eval_ortho_local.py --tif ... --labels ... --score_only --merge_m 0.6 --out debug/ortho_eval_tta
+
+python plot_ortho_eval.py   # regenerates the figures above
+```
+
+The labels JSON is the annotation export for the flight: point geometries with
+`label: "fish"`, and deleted points are ignored. A `--tta d4` run (all 8 rotations/flips)
+is also scored as `_none`, `_flip` and `_rot4`. Outputs are `summary.csv`,
+`detections.json` (raw detections before merging) and `overlay_*.jpg` (green = found,
+yellow = missed, red = false positive). Detections are saved after each method, so an
+interrupted run can still be scored with `--score_only`.
 
 ---
 
