@@ -14,11 +14,16 @@ demo_outputs/
 *_annotated.json
 
 # Local artifacts / experiment outputs
-debug/
+debug/*
+!debug/demo/
+!debug/counting_error_animations/
+!debug/ortho_eval_figures/
 frame_cache/
 input_videos/
 mlflow.db
 mlruns/
 *.mp4
+!debug/demo/*.mp4
+!debug/counting_error_animations/*.mp4
 ortho/*
 !ortho/inputs/
