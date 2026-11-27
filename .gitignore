@@ -12,3 +12,13 @@ demo_outputs/
 *_annotated.mp4
 *_annotated.png
 *_annotated.json
+
+# Local artifacts / experiment outputs
+debug/
+frame_cache/
+input_videos/
+mlflow.db
+mlruns/
+*.mp4
+ortho/*
+!ortho/inputs/
